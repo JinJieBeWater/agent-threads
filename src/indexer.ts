@@ -4,9 +4,9 @@ import { resolvePaths } from "./config.ts";
 import { CliFailure } from "./errors.ts";
 import { fileExists } from "./infra/fs.ts";
 import { waitForUnlockedIndex, withIndexBuildLock } from "./infra/lock.ts";
-import { all, exec, withDatabase } from "./infra/sqlite.ts";
+import { all, exec, get, withDatabase } from "./infra/sqlite.ts";
 import { chooseThreadTitle, parseJsonlSession, readStateThreads, walkJsonlFiles } from "./source/codex.ts";
-import type { GlobalOptions, MessageRecord, ParsedSessionFile, ResolvedPaths, ThreadRecord } from "./types.ts";
+import type { GlobalOptions, MessageRecord, ResolvedPaths, ThreadRecord } from "./types.ts";
 
 type IndexDatabase = Parameters<Parameters<typeof withDatabase>[1]>[0];
 
@@ -51,6 +51,20 @@ function findFirstMeaningfulUserMessage(messages: MessageRecord[]): MessageRecor
 
 function cleanTitleCandidate(value: string | null | undefined): string | null {
   return !value || isNoisyText(value) ? null : value;
+}
+
+function maxIsoTimestamp(left: string | null | undefined, right: string | null | undefined): string | null {
+  const leftTime = typeof left === "string" ? Date.parse(left) : Number.NaN;
+  const rightTime = typeof right === "string" ? Date.parse(right) : Number.NaN;
+
+  if (Number.isNaN(leftTime)) {
+    return typeof right === "string" ? right : null;
+  }
+  if (Number.isNaN(rightTime)) {
+    return typeof left === "string" ? left : null;
+  }
+
+  return leftTime >= rightTime ? (left as string) : (right as string);
 }
 
 function initializeIndexSchema(db: IndexDatabase): Effect.Effect<void, CliFailure> {
@@ -151,10 +165,49 @@ function isIndexReady(paths: ResolvedPaths): Effect.Effect<boolean, CliFailure> 
       return false;
     }
     const meta = yield* readIndexMeta(paths).pipe(Effect.catchAll(() => Effect.succeed<Record<string, string>>({})));
-    return (
+    const sourceMatches =
       meta.source_id === paths.sourceId &&
       meta.source_kind === paths.sourceKind &&
-      meta.source_root === paths.sourceRoot
+      meta.source_root === paths.sourceRoot;
+    if (!sourceMatches) {
+      return false;
+    }
+
+    return yield* withDatabase(paths.indexDb, (db) =>
+      Effect.gen(function* () {
+        const messagesTable = yield* get<Record<string, unknown>>(
+          db,
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+        );
+        if (!messagesTable) {
+          return true;
+        }
+
+        const totals = (yield* get<Record<string, unknown>>(
+          db,
+          `
+            SELECT
+              (SELECT COUNT(*) FROM messages) AS actual_messages,
+              (SELECT COALESCE(SUM(message_count), 0) FROM threads) AS thread_message_sum,
+              EXISTS(
+                SELECT 1
+                FROM messages
+                GROUP BY thread_id, seq
+                HAVING COUNT(*) > 1
+                LIMIT 1
+              ) AS has_duplicate_seq
+          `,
+        )) ?? {
+          actual_messages: 0,
+          thread_message_sum: 0,
+          has_duplicate_seq: 0,
+        };
+
+        return (
+          Number(totals.actual_messages ?? 0) === Number(totals.thread_message_sum ?? 0) &&
+          Number(totals.has_duplicate_seq ?? 0) === 0
+        );
+      }).pipe(Effect.catchAll(() => Effect.succeed(true))),
     );
   });
 }
@@ -169,14 +222,13 @@ function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<RebuildIndexS
       ...archivedSessionFiles.map((filePath) => ({ filePath, archived: true })),
     ];
 
-    const parsedSessions: ParsedSessionFile[] = [];
+    const threadMessages = new Map<string, MessageRecord[]>();
     for (const entry of allSessions) {
       const parsed = yield* parseJsonlSession(entry.filePath, entry.archived);
       if (!parsed) {
         continue;
       }
 
-      parsedSessions.push(parsed);
       const existing = threadMap.get(parsed.threadId) ?? {
         threadId: parsed.threadId,
         rolloutPath: null,
@@ -220,6 +272,10 @@ function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<RebuildIndexS
       existing.source = parsed.meta.source ?? existing.source;
       existing.cliVersion = parsed.meta.cliVersion ?? existing.cliVersion;
 
+      const collectedMessages = threadMessages.get(parsed.threadId) ?? [];
+      collectedMessages.push(...parsed.messages);
+      threadMessages.set(parsed.threadId, collectedMessages);
+
       const firstMeaningfulUser = findFirstMeaningfulUserMessage(parsed.messages);
       const firstUser = parsed.messages.find((message) => message.role === "user");
       if (!existing.firstUserMessage) {
@@ -231,15 +287,44 @@ function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<RebuildIndexS
         firstUserMessage: cleanTitleCandidate(firstMeaningfulUser?.text ?? existing.firstUserMessage),
       });
 
-      existing.messageCount = parsed.messages.length;
-      existing.userMessageCount = parsed.messages.filter((message) => message.role === "user").length;
-      existing.assistantMessageCount = parsed.messages.filter((message) => message.role === "assistant").length;
-      existing.lastMessageAt = parsed.messages[parsed.messages.length - 1]?.createdAt ?? existing.lastMessageAt;
       if (!existing.rolloutPath && parsed.meta.sourceFile) {
         existing.rolloutPath = parsed.meta.sourceFile;
       }
 
       threadMap.set(parsed.threadId, existing);
+    }
+
+    const canonicalThreadMessages = new Map<string, MessageRecord[]>();
+    for (const [threadId, messages] of threadMessages) {
+      const canonicalMessages = messages.map((message, index) => ({
+        ...message,
+        seq: index + 1,
+        messageRef: `${threadId}:${index + 1}`,
+      }));
+      canonicalThreadMessages.set(threadId, canonicalMessages);
+
+      const thread = threadMap.get(threadId);
+      if (!thread) {
+        continue;
+      }
+
+      thread.messageCount = canonicalMessages.length;
+      thread.userMessageCount = canonicalMessages.filter((message) => message.role === "user").length;
+      thread.assistantMessageCount = canonicalMessages.filter((message) => message.role === "assistant").length;
+      thread.lastMessageAt = canonicalMessages.reduce<string | null>(
+        (latest, message) => maxIsoTimestamp(latest, message.createdAt),
+        thread.lastMessageAt,
+      );
+
+      const firstMeaningfulUser = findFirstMeaningfulUserMessage(canonicalMessages);
+      const firstUser = canonicalMessages.find((message) => message.role === "user");
+      if (!thread.firstUserMessage) {
+        thread.firstUserMessage = firstMeaningfulUser?.text ?? firstUser?.text ?? null;
+      }
+      thread.title = chooseThreadTitle({
+        stateTitle: cleanTitleCandidate(thread.title),
+        firstUserMessage: cleanTitleCandidate(firstMeaningfulUser?.text ?? thread.firstUserMessage),
+      });
     }
 
     return yield* withDatabase(paths.indexDb, (db) =>
@@ -297,8 +382,8 @@ function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<RebuildIndexS
               );
             }
 
-            for (const session of parsedSessions) {
-              for (const message of session.messages) {
+            for (const messages of canonicalThreadMessages.values()) {
+              for (const message of messages) {
                 yield* exec(
                   db,
                   `INSERT INTO messages (

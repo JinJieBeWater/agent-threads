@@ -1071,6 +1071,96 @@ test("consecutive identical messages are preserved when they are separate events
   expect(payload.data.messages.map((message) => message.seq)).toEqual([1, 2, 3]);
 });
 
+test("rebuild aggregates messages across multiple session files for one thread", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-continued-1.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "continued",
+            cwd: "/tmp/continued",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "Continued thread",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:42:40.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "first question" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:42:41.000Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "first answer" },
+        }),
+        "",
+      ].join("\n"),
+    },
+    {
+      fileName: "rollout-continued-2.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "continued",
+            cwd: "/tmp/continued",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "Continued thread",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:40.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "follow up question" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:41.000Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "follow up answer" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:42.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "final question" },
+        }),
+        "",
+      ].join("\n"),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const inspectThread = runCli(["--json", "--refresh", "inspect", "thread", "continued"], sourceRoot, indexDb);
+  expect(inspectThread.status).toBe(0);
+  const threadPayload = JSON.parse(inspectThread.stdout) as {
+    ok: true;
+    data: { thread: Record<string, unknown> };
+  };
+  expect(threadPayload.data.thread.message_count).toBe(5);
+  expect(threadPayload.data.thread.user_message_count).toBe(3);
+  expect(threadPayload.data.thread.assistant_message_count).toBe(2);
+
+  const openThread = runCli(["--json", "open", "continued", "--format", "messages", "--full"], sourceRoot, indexDb);
+  expect(openThread.status).toBe(0);
+  const openPayload = JSON.parse(openThread.stdout) as {
+    ok: true;
+    data: { messages: Array<Record<string, unknown>> };
+  };
+  expect(openPayload.data.messages.map((message) => message.seq)).toEqual([1, 2, 3, 4, 5]);
+
+  const inspectIndex = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(inspectIndex.status).toBe(0);
+  const indexPayload = JSON.parse(inspectIndex.stdout) as {
+    ok: true;
+    data: Record<string, unknown>;
+  };
+  expect(indexPayload.data.thread_count).toBe(1);
+  expect(indexPayload.data.message_count).toBe(5);
+});
+
 test("human-readable message output preserves multiline full text", () => {
   const longMessage = ["Line one", "", "Line two", "", `${"x".repeat(260)}TAIL_MARKER`].join("\n");
   const sourceRoot = makeSourceRootFromSessionFile(
@@ -1196,7 +1286,7 @@ test("inspect source reflects agent-threads source-based naming", () => {
   expect(payload.data.sourceRoot).toBe(sourceRoot);
 });
 
-test("find ranking pushes noisy transcript threads behind clean matches", () => {
+test("find thread results hide noisy transcript-only matches when clean matches exist", () => {
   const sourceRoot = makeSourceRootFromSessionFiles([
     {
       fileName: "rollout-noisy.jsonl",
@@ -1247,8 +1337,109 @@ test("find ranking pushes noisy transcript threads behind clean matches", () => 
     ok: true;
     data: { results: Array<Record<string, unknown>> };
   };
+  expect(payload.data.results).toHaveLength(1);
   expect(payload.data.results[0]?.thread_id).toBe("clean");
-  expect(payload.data.results[1]?.thread_id).toBe("noisy");
+});
+
+test("find thread results still fall back to noisy transcript-only matches when they are the only hits", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-noisy-only.jsonl",
+      contents: [
+        JSON.stringify({
+          timestamp: "2026-04-11T03:10:00.000Z",
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "# AGENTS.md instructions\n\n>>> APPROVAL REQUEST START\npayment callback incident",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T03:10:05.000Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "tool exec_command result: payment callback log" },
+        }),
+        "",
+      ].join("\n"),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    ["--json", "--refresh", "find", "payment", "--kind", "thread", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results).toHaveLength(1);
+  expect(payload.data.results[0]?.thread_id).toBe("noisy-only");
+});
+
+test("find thread search does not treat short ascii queries as arbitrary substrings inside other words", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-path-noise.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "path-noise",
+            cwd: "/tmp/path-noise",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "Path cleanup",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T03:10:00.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "Please update the path handling flow." },
+        }),
+        "",
+      ].join("\n"),
+    },
+    {
+      fileName: "rollout-ath-token.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "ath-token",
+            cwd: "/tmp/ath-token",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "ath install help",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T03:11:00.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "How do I install ath locally?" },
+        }),
+        "",
+      ].join("\n"),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    ["--json", "--refresh", "find", "ath", "--kind", "thread", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results).toHaveLength(1);
+  expect(payload.data.results[0]?.thread_id).toBe("ath-token");
 });
 
 test("changing source root with a shared index triggers a rebuild", () => {

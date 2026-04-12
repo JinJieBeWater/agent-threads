@@ -29,12 +29,21 @@ function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function containsTextExpression(columnName: string): string {
   return `(instr(${columnName}, ?) > 0 OR instr(lower(${columnName}), lower(?)) > 0)`;
 }
 
 function normalizedEpochExpression(columnName: string): string {
   return `(CASE WHEN ${columnName} > 0 AND ${columnName} < ${EPOCH_MS_THRESHOLD} THEN ${columnName} * 1000 ELSE ${columnName} END)`;
+}
+
+function noisyTextSqlExpression(columnName: string): string {
+  const escapedPatterns = NOISY_TEXT_PATTERNS.map((pattern) => pattern.replace(/'/g, "''"));
+  return `(${[`length(trim(${columnName})) > 1500`, ...escapedPatterns.map((pattern) => `instr(${columnName}, '${pattern}') > 0`)].join(" OR ")})`;
 }
 
 function firstString(...values: unknown[]): string | null {
@@ -44,6 +53,15 @@ function firstString(...values: unknown[]): string | null {
     }
   }
   return null;
+}
+
+function hasCleanThreadMetadata(title: string | null, firstUserMessage: string | null): boolean {
+  return (
+    (typeof title === "string" && title.length > 0 && !isNoisyText(title)) ||
+    (typeof firstUserMessage === "string" &&
+      firstUserMessage.length > 0 &&
+      !isNoisyText(firstUserMessage))
+  );
 }
 
 export function buildSnippet(value: string, query: string, maxLength = SNIPPET_LENGTH): string {
@@ -80,6 +98,21 @@ export function buildSnippet(value: string, query: string, maxLength = SNIPPET_L
     snippet = `${snippet}...`;
   }
   return snippet;
+}
+
+function matchesSearchText(value: string | null | undefined, query: string): boolean {
+  const normalizedValue = typeof value === "string" ? normalizeSearchText(value) : "";
+  const normalizedQuery = normalizeSearchText(query);
+  if (normalizedValue.length === 0 || normalizedQuery.length === 0) {
+    return false;
+  }
+
+  if (/^[A-Za-z0-9_-]{2,}$/.test(normalizedQuery)) {
+    const boundaryPattern = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(normalizedQuery)}([^A-Za-z0-9_]|$)`, "i");
+    return boundaryPattern.test(normalizedValue);
+  }
+
+  return normalizedValue.toLowerCase().includes(normalizedQuery.toLowerCase());
 }
 
 export function isNoisyText(value: string | null | undefined): boolean {
@@ -219,16 +252,18 @@ export function searchThreads(
           LIMIT ?
         `,
       ...threadParams,
-      options.limit * 2,
+      options.limit * 3,
     );
 
     for (const thread of titleMatches) {
       const title = typeof thread.title === "string" ? thread.title : null;
       const firstUserMessage =
         typeof thread.first_user_message === "string" ? thread.first_user_message : null;
+      const metadataNoisy = hasCleanThreadMetadata(title, firstUserMessage) ? 0 : 1;
       result.set(String(thread.thread_id), {
         thread_id: thread.thread_id,
         title,
+        first_user_message: firstUserMessage,
         model_provider: thread.model_provider,
         cwd: thread.cwd,
         updated_at: thread.updated_at,
@@ -241,7 +276,9 @@ export function searchThreads(
         title_match: 1,
         message_hit_count: 0,
         message_snippet: null,
-        noisy_match: isNoisyText(title) || isNoisyText(firstUserMessage) ? 1 : 0,
+        metadata_noisy: metadataNoisy,
+        matched_text_noisy: 1,
+        noisy_match: metadataNoisy,
       });
     }
 
@@ -267,30 +304,57 @@ export function searchThreads(
     const messageMatches = yield* all<Record<string, unknown>>(
       db,
       `
+          WITH matched_messages AS (
+            SELECT
+              t.thread_id,
+              t.title,
+              t.model_provider,
+              t.cwd,
+              ${joinedUpdatedAtExpression} AS updated_at,
+              t.archived,
+              t.source_kind,
+              t.message_count,
+              t.user_message_count,
+              t.assistant_message_count,
+              t.last_message_at,
+              t.first_user_message,
+              m.text AS matched_text,
+              CASE WHEN ${noisyTextSqlExpression("m.text")} THEN 1 ELSE 0 END AS matched_text_noisy,
+              ROW_NUMBER() OVER (
+                PARTITION BY t.thread_id
+                ORDER BY
+                  CASE WHEN ${noisyTextSqlExpression("m.text")} THEN 1 ELSE 0 END ASC,
+                  m.created_at DESC NULLS LAST,
+                  m.message_pk DESC
+              ) AS row_num,
+              COUNT(*) OVER (PARTITION BY t.thread_id) AS message_hit_count
+            FROM messages m
+            JOIN threads t ON t.thread_id = m.thread_id
+            WHERE ${messageWhere.join(" AND ")}
+          )
           SELECT
-            t.thread_id,
-            t.title,
-            t.model_provider,
-            t.cwd,
-            ${joinedUpdatedAtExpression} AS updated_at,
-            t.archived,
-            t.source_kind,
-            t.message_count,
-            t.user_message_count,
-            t.assistant_message_count,
-            t.last_message_at,
-            t.first_user_message,
-            COUNT(*) AS message_hit_count,
-            MIN(m.text) AS matched_text
-          FROM messages m
-          JOIN threads t ON t.thread_id = m.thread_id
-          WHERE ${messageWhere.join(" AND ")}
-          GROUP BY t.thread_id
-          ORDER BY message_hit_count DESC, ${joinedUpdatedAtExpression} DESC NULLS LAST
+            thread_id,
+            title,
+            model_provider,
+            cwd,
+            updated_at,
+            archived,
+            source_kind,
+            message_count,
+            user_message_count,
+            assistant_message_count,
+            last_message_at,
+            first_user_message,
+            message_hit_count,
+            matched_text,
+            matched_text_noisy
+          FROM matched_messages
+          WHERE row_num = 1
+          ORDER BY matched_text_noisy ASC, message_hit_count DESC, updated_at DESC NULLS LAST
           LIMIT ?
         `,
       ...messageParams,
-      options.limit * 3,
+      options.limit * 5,
     );
 
     for (const thread of messageMatches) {
@@ -300,10 +364,13 @@ export function searchThreads(
       const firstUserMessage =
         typeof thread.first_user_message === "string" ? thread.first_user_message : null;
       const matchedText = typeof thread.matched_text === "string" ? thread.matched_text : null;
+      const metadataNoisy = hasCleanThreadMetadata(title, firstUserMessage) ? 0 : 1;
+      const matchedTextNoisy = matchedText ? Number(thread.matched_text_noisy ?? 0) : 1;
       result.set(threadId, {
         ...(current ?? {
           thread_id: thread.thread_id,
           title,
+          first_user_message: firstUserMessage,
           model_provider: thread.model_provider,
           cwd: thread.cwd,
           updated_at: thread.updated_at,
@@ -316,9 +383,12 @@ export function searchThreads(
           title_match: 0,
           message_hit_count: 0,
           message_snippet: null,
+          metadata_noisy: metadataNoisy,
+          matched_text_noisy: 1,
           noisy_match: 0,
         }),
         title,
+        first_user_message: firstUserMessage,
         model_provider: thread.model_provider,
         cwd: thread.cwd,
         updated_at: thread.updated_at,
@@ -331,16 +401,32 @@ export function searchThreads(
         title_match: Number((current?.title_match as number | undefined) ?? 0),
         message_hit_count: Number(thread.message_hit_count ?? 0),
         message_snippet: matchedText ? buildSnippet(matchedText, options.query) : null,
-        noisy_match:
-          isNoisyText(title) || isNoisyText(firstUserMessage) || isNoisyText(matchedText) ? 1 : 0,
+        metadata_noisy: metadataNoisy,
+        matched_text_noisy: matchedTextNoisy,
+        noisy_match: metadataNoisy && matchedTextNoisy ? 1 : 0,
       });
     }
 
-    return Array.from(result.values())
+    const sortedResults = Array.from(result.values())
+      .filter((row) => {
+        const title = typeof row.title === "string" ? row.title : null;
+        const firstUserMessage =
+          typeof row.first_user_message === "string" ? row.first_user_message : null;
+        const messageSnippet = typeof row.message_snippet === "string" ? row.message_snippet : null;
+        return (
+          matchesSearchText(title, options.query) ||
+          matchesSearchText(firstUserMessage, options.query) ||
+          matchesSearchText(messageSnippet, options.query)
+        );
+      })
       .sort((left, right) => {
         const noisyDelta = Number(left.noisy_match ?? 0) - Number(right.noisy_match ?? 0);
         if (noisyDelta !== 0) {
           return noisyDelta;
+        }
+        const metadataDelta = Number(left.metadata_noisy ?? 0) - Number(right.metadata_noisy ?? 0);
+        if (metadataDelta !== 0) {
+          return metadataDelta;
         }
         const titleDelta = Number(right.title_match ?? 0) - Number(left.title_match ?? 0);
         if (titleDelta !== 0) {
@@ -351,8 +437,11 @@ export function searchThreads(
           return hitDelta;
         }
         return Number(right.updated_at ?? 0) - Number(left.updated_at ?? 0);
-      })
-      .slice(0, options.limit);
+      });
+
+    const cleanResults = sortedResults.filter((row) => Number(row.noisy_match ?? 0) === 0);
+    const noisyResults = sortedResults.filter((row) => Number(row.noisy_match ?? 0) !== 0);
+    return (cleanResults.length > 0 ? cleanResults : noisyResults).slice(0, options.limit);
     }),
   );
 }
@@ -384,16 +473,27 @@ export function getThreadMessages(
 export function getThreadStats(paths: ResolvedPaths): Effect.Effect<Record<string, unknown>, CliFailure> {
   return withDatabase(paths.indexDb, (db) =>
     Effect.gen(function* () {
+    const messagesTable = yield* get<Record<string, unknown>>(
+      db,
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'`,
+    );
     const totals = (yield* get<Record<string, unknown>>(
       db,
       `
           SELECT
             COUNT(*) AS thread_count,
             SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_count,
-            COALESCE(SUM(message_count), 0) AS message_count
+            COALESCE(SUM(message_count), 0) AS indexed_message_count
           FROM threads
         `,
     )) ?? {};
+    const actualMessageTotals =
+      messagesTable
+        ? ((yield* get<Record<string, unknown>>(
+            db,
+            `SELECT COUNT(*) AS message_count FROM messages`,
+          )) ?? {})
+        : {};
 
     const providers = yield* all<Record<string, unknown>>(
       db,
@@ -420,6 +520,7 @@ export function getThreadStats(paths: ResolvedPaths): Effect.Effect<Record<strin
 
     return {
       ...totals,
+      message_count: Number(actualMessageTotals.message_count ?? totals.indexed_message_count ?? 0),
       providers,
       topCwds,
       meta: Object.fromEntries(meta.map((row) => [row.key, row.value])),
