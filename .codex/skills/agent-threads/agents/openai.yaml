@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Threads"
-  short_description: "Search local agent thread history."
-  default_prompt: "Use $agent-threads to find a relevant past conversation and reuse the useful pattern safely."
+  short_description: "Search local agent history with ath."
+  default_prompt: "Use $agent-threads to find a relevant past conversation with ath, inspect the exact context you need, and reuse the useful pattern safely."

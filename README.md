@@ -1,63 +1,126 @@
-# agent-threads
+# ath
 
-`agent-threads` is a local, read-only CLI for indexing and querying agent conversation history.
+`ath` is the only CLI command you need for indexing and querying local agent conversation history.
 
-Today it supports a `codex` source rooted at `~/.codex`. The shape is intentionally source-based so it can grow into a broader cross-agent history tool without renaming the project again.
+This repository is still named `agent-threads`, but the user-facing command surface is `ath`.
+Today it supports a `codex` source rooted at `~/.codex`.
+
+## Quickstart
+
+Requirements:
+
+- Bun `>= 1.3.0`
+- Codex history available at the default source root `~/.codex`
+
+Fast path:
+
+```bash
+bun install
+make install-local
+
+ath --json inspect source
+ath find "error handling"
+```
+
+By default, `ath` reads Codex history from `~/.codex` and stores its local index under `~/.agent-threads`.
 
 ## What It Does
 
 - Builds a local SQLite index from session history
-- Searches threads by title, first user message, and message hits
-- Searches messages by text and returns snippets by default
-- Reads exact local context around one message
-- Opens one thread as a bounded excerpt by default, or as a full transcript with `--full`
+- Uses one search entrypoint for both threads and messages
+- Uses one open entrypoint for both whole threads and message-local context
+- Keeps source and index diagnostics under `inspect`
+- Keeps maintenance and advanced escape hatches under `admin`
 - Exports one thread as Markdown or JSON
 
 ## Command Surface
 
 ```bash
-agent-threads --json doctor
-agent-threads init --source local-codex --source-root ~/.codex
-agent-threads index rebuild
+ath --json inspect source
+ath admin init --source local-codex --source-root ~/.codex
+ath admin reindex
 
-agent-threads threads list --limit 20
-agent-threads threads search "refactor pattern"
-agent-threads threads get <thread-id>
-agent-threads threads open <thread-id> --format messages
-agent-threads threads open <thread-id> --format messages --full
-agent-threads threads related <thread-id>
-agent-threads threads stats
+ath find "refactor pattern"
+ath find "retry strategy" --kind message
+ath recent --limit 20
+ath recent --since 7d
+ath open <thread-id>
+ath open <thread-id>:12 --before 2 --after 2
+ath open <thread-id> --format messages --full
 
-agent-threads messages search "retry strategy"
-agent-threads messages context <thread-id> --message <message-seq> --before 2 --after 2
+ath inspect index
+ath inspect thread <thread-id> --related
 
-agent-threads export thread <thread-id> --format md --out /tmp/thread.md
-agent-threads request sql "select thread_id, count(*) from messages group by 1 order by 2 desc limit 10"
+ath export <thread-id> --format md --out /tmp/thread.md
+ath admin sql "select thread_id, count(*) from messages group by 1 order by 2 desc limit 10"
 ```
 
-Short alias:
+Use this executable:
 
 ```bash
-ath threads search "error handling"
+ath find "error handling"
 ```
 
 ## Recommended Flow
 
 Use this order unless you already know the exact thread:
 
-1. `threads search`
-2. `messages search` if the query is more textual than topical
-3. `messages context` once you know the thread and anchor
-4. `threads open --format messages --full` only when you truly want the whole transcript
+1. `find`
+2. `recent` when you want to see what the user was working on lately
+3. `open <thread-id>` when you want the session
+4. `open <thread-id>:<seq>` when you want local context around one message
+5. `inspect` when you need source or index state
+6. `admin` only for maintenance or advanced SQL
 
 Examples:
 
 ```bash
-agent-threads --json threads search "error handling"
-agent-threads --json messages search "retry strategy"
-agent-threads --json messages context <thread-id> --message 12 --before 2 --after 3
-agent-threads --json threads open <thread-id> --format messages --full
+ath --json find "error handling"
+ath --json find "retry strategy" --kind message
+ath --json recent --limit 10
+ath --json recent --since 3d
+ath --json open <thread-id>:12 --before 2 --after 3
+ath --json open <thread-id> --format messages --full
+ath --json inspect index
 ```
+
+## Search by Time Range
+
+Use `find` when you want threads or messages that mention a keyword within a specific time window.
+Use `recent` when you only want the newest threads, not keyword search.
+
+Examples:
+
+```bash
+# One day
+ath --json find "xxx" --kind message \
+  --since 2026-04-11T00:00:00+08:00 \
+  --until 2026-04-11T23:59:59+08:00
+
+# Last 30 days
+ath --json find "xxx" --kind message --since 30d
+
+# One calendar month
+ath --json find "xxx" --kind message \
+  --since 2026-03-01T00:00:00+08:00 \
+  --until 2026-03-31T23:59:59+08:00
+
+# Any custom range
+ath --json find "xxx" --kind thread \
+  --since 2026-01-01T00:00:00Z \
+  --until 2026-04-01T00:00:00Z
+```
+
+Time filter rules:
+
+- `--since` and `--until` are supported by both `find` and `recent`
+- Relative time supports `m`, `h`, `d`, and `w`
+- `m` means minutes, not months
+- For "one month", prefer `30d` or an explicit absolute range
+- Absolute timestamps use anything `Date.parse(...)` can parse reliably; ISO 8601 with timezone is recommended
+- Use `--kind message` when the keyword should match message text
+- Use `--kind thread` when you want thread-level results
+- Omit `--kind` to merge both result types into one ranked list
 
 ## Defaults
 
@@ -102,26 +165,52 @@ For a `codex` source, the CLI reads:
 
 ```bash
 cd /path/to/agent-threads
+bun install
 make install-local
-command -v agent-threads
 command -v ath
-agent-threads --json doctor
+ath --json inspect source
 ```
+
+Naming:
+
+- Repository directory: `agent-threads`
+- CLI command: `ath`
+
+## Development Checks
+
+```bash
+bun run typecheck
+bun run lint
+bun run test
+bun run check
+```
+
+`bun run check` runs typecheck, lint, and tests together.
 
 ## Output Notes
 
 - The tool is read-only.
 - `--json` is compact by default. Use `--json-pretty` only when a human is inspecting raw output.
-- `threads list`, `threads search`, and `messages search` return compact agent-first shapes.
-- `messages search` returns snippets, not full message bodies.
-- `threads open --format messages` returns a bounded excerpt by default. Add `--full` only when you want the full transcript.
-- `request sql` only allows read-only `SELECT` and `WITH` queries against the generated index.
+- `find` returns a unified result stream with `kind`, `target`, and compact snippets.
+- `recent` lists threads by newest `updated_at` first and prints one compact summary line per thread.
+- `open <thread-id>` returns a thread view; `open <thread-id>:<seq>` returns message-local context.
+- `open --format messages` returns a bounded excerpt by default. Add `--full` only when you want the full transcript.
+- `admin sql` only allows read-only `SELECT` and `WITH` queries against the generated index.
 
 ## Layout
 
-- `src/index.ts`: CLI registration
-- `src/handlers.ts`: command behavior
-- `src/store.ts`: indexing and query logic
+- `src/index.ts`: executable entrypoint
+- `src/main.ts`: Effect runtime startup
+- `src/cli.ts`: Effect CLI command tree
+- `src/handlers.ts`: command behavior and command-surface orchestration
+- `src/indexer.ts`: index rebuild and readiness logic
+- `src/threads.ts`: thread queries
+- `src/messages.ts`: message queries
+- `src/request.ts`: read-only SQL guard and execution
+- `src/export.ts`: export and raw transcript helpers
+- `src/source/codex.ts`: codex source parsing and session reads
+- `src/infra/sqlite.ts`: SQLite boundary
+- `src/infra/lock.ts`: index lock boundary
 - `src/output.ts`: JSON and human output
 - `src/render.ts`: human-readable rendering
 - `src/errors.ts`: CLI error model

@@ -1,13 +1,11 @@
+import { Schema } from "effect";
+
 import type { CliError, CliSuccess } from "./types.ts";
 
-export class CliFailure extends Error {
-  code: string;
-
-  constructor(code: string, message: string) {
-    super(message);
-    this.code = code;
-  }
-}
+export class CliFailure extends Schema.TaggedError<CliFailure>()("CliFailure", {
+  code: Schema.String,
+  message: Schema.String,
+}) {}
 
 export function asJson<T>(data: T): CliSuccess<T> {
   return { ok: true, data };

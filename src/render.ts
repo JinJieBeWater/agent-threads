@@ -1,10 +1,16 @@
-import { basename } from "node:path";
-
 function formatEpochMs(value: unknown): string {
-  if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
-    return "-";
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const normalized = value < 1_000_000_000_000 ? value * 1_000 : value;
+    return new Date(normalized).toISOString();
   }
-  return new Date(value).toISOString();
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      const normalized = numeric < 1_000_000_000_000 ? numeric * 1_000 : numeric;
+      return new Date(normalized).toISOString();
+    }
+  }
+  return "-";
 }
 
 function truncate(text: unknown, maxLength = 120): string {
@@ -26,20 +32,39 @@ function readMessageText(message: Record<string, unknown>): string {
       : "";
 }
 
-export function renderThreadList(threads: Array<Record<string, unknown>>): string {
-  if (threads.length === 0) {
-    return "No threads matched.";
-  }
+export function renderCliHome(input: {
+  name: string;
+  version: string;
+}): string {
+  const { name, version } = input;
+  const commands = [
+    ["find <query>", "Search threads and messages"],
+    ["recent", "List recently updated threads"],
+    ["open <target>", "Open a thread or message context"],
+    ["inspect <subject>", "Inspect source or index state"],
+    ["export <thread-id>", "Export one thread as md or json"],
+    ["admin <action>", "Maintenance and read-only SQL"],
+  ] as const;
+  const commandWidth = Math.max(...commands.map(([usage]) => usage.length));
 
-  return threads
-    .map((thread) => {
-      const updatedAt = formatEpochMs(thread.updated_at);
-      const provider = (thread.model_provider as string | null) ?? "-";
-      const cwd = basename((thread.cwd as string | null) ?? "") || "-";
-      const title = truncate(thread.title, 160) || "(untitled)";
-      return `${thread.thread_id}  [${provider}]  ${updatedAt}  ${cwd}\n  ${title}`;
-    })
-    .join("\n");
+  return [
+    `${name} ${version}`,
+    "",
+    "Local CLI for searching and reading agent session history.",
+    "",
+    "Quickstart",
+    `  ${name} inspect source`,
+    `  ${name} find "error handling"`,
+    `  ${name} recent --limit 10`,
+    `  ${name} open <thread-id>:12 --before 2 --after 2`,
+    "",
+    "Commands",
+    ...commands.map(([usage, description]) => `  ${usage.padEnd(commandWidth)}  ${description}`),
+    "",
+    "Help",
+    `  ${name} --help`,
+    `  ${name} <command> --help`,
+  ].join("\n");
 }
 
 export function renderMessageList(
@@ -65,6 +90,45 @@ export function renderMessageList(
       const bodySource = readMessageText(message);
       const body = truncateMessages ? truncate(bodySource, 220) : bodySource;
       return `#${seq}  ${role}  ${createdAt}\n${body}`;
+    })
+    .join("\n\n");
+}
+
+export function renderFindResults(results: Array<Record<string, unknown>>): string {
+  if (results.length === 0) {
+    return "No results matched.";
+  }
+
+  return results
+    .map((result) => {
+      const kind = result.kind === "message" ? "message" : "thread";
+      const target = typeof result.target === "string" ? result.target : "-";
+      const title = truncate(result.title, 140) || "(untitled)";
+      const snippet = truncate(result.snippet, 220);
+      const timestamp =
+        typeof result.updated_at === "string"
+          ? result.updated_at
+          : typeof result.created_at === "string"
+            ? result.created_at
+            : "-";
+      return `[${kind}] ${target}\n${title}\n${snippet}${snippet ? "\n" : ""}${timestamp}`;
+    })
+    .join("\n\n");
+}
+
+export function renderRecentResults(results: Array<Record<string, unknown>>): string {
+  if (results.length === 0) {
+    return "No recent threads matched.";
+  }
+
+  return results
+    .map((result) => {
+      const target = typeof result.target === "string" ? result.target : "-";
+      const firstUserMessage = truncate(result.first_user_message, 220);
+      const title = truncate(result.title, 140);
+      const summary = firstUserMessage || title || "(untitled)";
+      const timestamp = typeof result.updated_at === "string" ? result.updated_at : "-";
+      return `[thread] ${target}\n${summary}\n${timestamp}`;
     })
     .join("\n\n");
 }

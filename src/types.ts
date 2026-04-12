@@ -10,6 +10,41 @@ export interface GlobalOptions {
   indexDb?: string;
 }
 
+export type ThreadOpenFormat = "summary" | "messages" | "jsonl";
+export type ExportFormat = "md" | "json";
+
+export interface ExportActionOptions {
+  format: ExportFormat;
+  out?: string;
+}
+
+export type FindKind = "all" | "thread" | "message";
+
+export interface FindActionOptions {
+  kind: FindKind;
+  provider?: string;
+  cwd?: string;
+  role?: string;
+  limit: number;
+  since?: string;
+  until?: string;
+}
+
+export interface RecentActionOptions {
+  provider?: string;
+  cwd?: string;
+  limit: number;
+  since?: string;
+  until?: string;
+}
+
+export interface OpenActionOptions {
+  format: ThreadOpenFormat;
+  full: boolean;
+  before: number;
+  after: number;
+}
+
 export interface SourceConfig {
   id: string;
   kind: "codex";
@@ -19,7 +54,7 @@ export interface SourceConfig {
 export interface ConfigFile {
   defaultSource?: string;
   indexDb?: string;
-  sources?: SourceConfig[];
+  sources?: readonly SourceConfig[];
 }
 
 export interface ResolvedPaths {
