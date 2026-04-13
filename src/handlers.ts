@@ -1,9 +1,11 @@
 import { Effect } from "effect";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { resolvePaths, writeConfigFile } from "./config.ts";
 import { CliFailure } from "./errors.ts";
 import { exportThreadData, readRawJsonl } from "./export.ts";
-import { fileExists } from "./infra/fs.ts";
+import { fileExists, removeFile } from "./infra/fs.ts";
 import { ensureIndex, readIndexMeta, rebuildIndex } from "./indexer.ts";
 import { getMessageContext, searchMessages } from "./messages.ts";
 import { runReadOnlySql } from "./request.ts";
@@ -126,12 +128,58 @@ function withReadyIndex<A>(
   callback: (paths: ResolvedPaths) => Effect.Effect<A, CliFailure>,
 ): Effect.Effect<A, CliFailure> {
   return withResolvedPaths(options, (paths) =>
-    ensureIndex(paths, options.refresh).pipe(Effect.flatMap(() => callback(paths))),
+    Effect.matchEffect(ensureIndex(paths, options.refresh), {
+      onFailure: (error) => {
+        if (!shouldUseTemporaryIndexFallback(error, paths)) {
+          return Effect.fail(error);
+        }
+
+        return withTemporaryIndex(paths, (temporaryPaths) =>
+          ensureIndex(temporaryPaths, options.refresh).pipe(Effect.flatMap(() => callback(temporaryPaths))),
+        );
+      },
+      onSuccess: () => callback(paths),
+    }),
   );
 }
 
 function fail(code: string, message: string): Effect.Effect<never, CliFailure> {
   return Effect.fail(new CliFailure({ code, message }));
+}
+
+function shouldUseTemporaryIndexFallback(error: CliFailure, paths: ResolvedPaths): boolean {
+  return error.code === "fs-open-failed" && paths.configSource.indexDb !== "flag";
+}
+
+function buildTemporaryIndexPaths(paths: ResolvedPaths): ResolvedPaths {
+  const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    ...paths,
+    indexDb: join(tmpdir(), `agent-threads-${suffix}.sqlite`),
+  };
+}
+
+function withTemporaryIndex<A>(
+  paths: ResolvedPaths,
+  callback: (temporaryPaths: ResolvedPaths) => Effect.Effect<A, CliFailure>,
+): Effect.Effect<A, CliFailure> {
+  const temporaryPaths = buildTemporaryIndexPaths(paths);
+  const cleanupPaths = [
+    temporaryPaths.indexDb,
+    `${temporaryPaths.indexDb}.lock`,
+    `${temporaryPaths.indexDb}-shm`,
+    `${temporaryPaths.indexDb}-wal`,
+  ];
+
+  return Effect.acquireUseRelease(
+    Effect.succeed(temporaryPaths),
+    callback,
+    () =>
+      Effect.forEach(cleanupPaths, (path) => removeFile(path).pipe(Effect.catchAll(() => Effect.void)), {
+        concurrency: "unbounded",
+        discard: true,
+      }),
+  );
 }
 
 function getExistingThread(

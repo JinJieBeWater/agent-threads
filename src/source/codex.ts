@@ -397,6 +397,36 @@ export function parseJsonlSession(filePath: string, archived: boolean): Effect.E
   });
 }
 
+export function inferThreadIdFromSessionFile(filePath: string): Effect.Effect<string | null, CliFailure> {
+  return Effect.gen(function* () {
+    const fileName = basename(filePath);
+    let threadId = extractFallbackThreadId(fileName);
+    const lines = (yield* readFileString(filePath)).split("\n");
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = (lines[index] ?? "").trim();
+      if (line.length === 0) {
+        continue;
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        break;
+      }
+
+      if (parsed.type === "session_meta" && parsed.payload && typeof parsed.payload === "object") {
+        const payload = parsed.payload as Record<string, unknown>;
+        threadId = firstString(payload.id) ?? threadId;
+        break;
+      }
+    }
+
+    return threadId || null;
+  });
+}
+
 export function readRawJsonl(
   thread: Record<string, unknown> | null,
 ): Effect.Effect<{

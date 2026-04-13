@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -390,6 +390,107 @@ function runRawCli(args: string[]) {
   });
 }
 
+function makeSessionJsonl(input: {
+  threadId: string;
+  title: string;
+  cwd?: string;
+  provider?: string;
+  messages: Array<{
+    timestamp: string;
+    role: "user" | "assistant";
+    text: string;
+  }>;
+}) {
+  return [
+    JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: input.threadId,
+        cwd: input.cwd ?? "/tmp/project",
+        source: "cli",
+        model_provider: input.provider ?? "Spencer",
+        thread_name: input.title,
+      },
+    }),
+    ...input.messages.map((message) =>
+      JSON.stringify({
+        timestamp: message.timestamp,
+        type: "event_msg",
+        payload: {
+          type: message.role === "user" ? "user_message" : "agent_message",
+          ...(message.role === "assistant" ? { phase: "final_answer" } : {}),
+          message: message.text,
+        },
+      }),
+    ),
+    "",
+  ].join("\n");
+}
+
+function getDefaultSessionPath(root: string) {
+  return join(root, "sessions", "2026", "04", "11", "rollout-thread-epay-fix.jsonl");
+}
+
+function updateStateThread(dbPath: string, threadId: string, patch: { title?: string; updatedAt?: number; archived?: number }) {
+  const db = new Database(dbPath);
+  try {
+    if (patch.title !== undefined) {
+      db.query(`UPDATE threads SET title = ? WHERE id = ?`).run(patch.title, threadId);
+    }
+    if (patch.updatedAt !== undefined) {
+      db.query(`UPDATE threads SET updated_at = ? WHERE id = ?`).run(patch.updatedAt, threadId);
+    }
+    if (patch.archived !== undefined) {
+      db.query(`UPDATE threads SET archived = ? WHERE id = ?`).run(patch.archived, threadId);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function readIndexedThread(indexDb: string, threadId: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    return db
+      .query(
+        `SELECT thread_id, title, message_count, file_exists, source_file, updated_at, archived FROM threads WHERE thread_id = ?`,
+      )
+      .get(threadId) as
+      | {
+          thread_id: string;
+          title: string;
+          message_count: number;
+          file_exists: number;
+          source_file: string;
+          updated_at: number;
+          archived: number;
+        }
+      | null;
+  } finally {
+    db.close();
+  }
+}
+
+function readThreadCount(indexDb: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    const row = db.query(`SELECT COUNT(*) AS count FROM threads`).get() as { count: number };
+    return row.count;
+  } finally {
+    db.close();
+  }
+}
+
+function readMetaValue(indexDb: string, key: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    const row = db.query(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | null;
+    return row?.value ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 test("inspect source reports offline local state without auth", () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
@@ -432,6 +533,356 @@ test("find and open work against rebuilt local index", () => {
   };
   expect(contextPayload.data.anchor.seq).toBe(2);
   expect(contextPayload.data.messages.length).toBe(3);
+});
+
+test("incremental sync leaves unchanged indexes as a no-op", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "find", "notify_url"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const builtAtBefore = readMetaValue(indexDb, "built_at");
+  const threadBefore = readIndexedThread(indexDb, "thread-epay-fix");
+
+  const second = runCli(["--json", "find", "notify_url"], sourceRoot, indexDb);
+  expect(second.status).toBe(0);
+
+  const builtAtAfter = readMetaValue(indexDb, "built_at");
+  const threadAfter = readIndexedThread(indexDb, "thread-epay-fix");
+
+  expect(builtAtAfter).toBe(builtAtBefore);
+  expect(threadAfter?.message_count).toBe(threadBefore?.message_count);
+  expect(threadAfter?.updated_at).toBe(threadBefore?.updated_at);
+});
+
+test("incremental sync indexes a newly added session file without rebuilding other threads", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+  const original = readIndexedThread(indexDb, "thread-epay-fix");
+
+  const newSessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-new.jsonl");
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: "thread-new",
+      title: "Thread new",
+      messages: [
+        {
+          timestamp: "2026-04-11T05:00:00.000Z",
+          role: "user",
+          text: "new thread question",
+        },
+        {
+          timestamp: "2026-04-11T05:00:15.000Z",
+          role: "assistant",
+          text: "new thread answer",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  const result = runCli(["--json", "recent", "--limit", "10"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  expect(readThreadCount(indexDb)).toBe(2);
+  expect(readIndexedThread(indexDb, "thread-new")?.message_count).toBe(2);
+  expect(readIndexedThread(indexDb, "thread-epay-fix")?.message_count).toBe(original?.message_count);
+});
+
+test("incremental sync rebuilds only the changed thread", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-thread-a.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "thread-a",
+        title: "Thread A",
+        messages: [
+          {
+            timestamp: "2026-04-11T03:00:00.000Z",
+            role: "user",
+            text: "alpha needle",
+          },
+          {
+            timestamp: "2026-04-11T03:00:15.000Z",
+            role: "assistant",
+            text: "alpha answer",
+          },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-thread-b.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "thread-b",
+        title: "Thread B",
+        messages: [
+          {
+            timestamp: "2026-04-11T04:00:00.000Z",
+            role: "user",
+            text: "beta needle",
+          },
+          {
+            timestamp: "2026-04-11T04:00:15.000Z",
+            role: "assistant",
+            text: "beta answer",
+          },
+        ],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const beforeA = readIndexedThread(indexDb, "thread-a");
+  const beforeB = readIndexedThread(indexDb, "thread-b");
+  const sessionAPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-a.jsonl");
+
+  writeFileSync(
+    sessionAPath,
+    makeSessionJsonl({
+      threadId: "thread-a",
+      title: "Thread A",
+      messages: [
+        {
+          timestamp: "2026-04-11T03:00:00.000Z",
+          role: "user",
+          text: "alpha needle",
+        },
+        {
+          timestamp: "2026-04-11T03:00:15.000Z",
+          role: "assistant",
+          text: "alpha answer",
+        },
+        {
+          timestamp: "2026-04-11T03:01:00.000Z",
+          role: "assistant",
+          text: "alpha follow-up",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  const result = runCli(["--json", "find", "alpha"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  expect(readIndexedThread(indexDb, "thread-a")?.message_count).toBe((beforeA?.message_count ?? 0) + 1);
+  expect(readIndexedThread(indexDb, "thread-b")?.message_count).toBe(beforeB?.message_count);
+});
+
+test("incremental sync preserves sibling session files for one thread", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-continued-1.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "continued",
+            cwd: "/tmp/continued",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "Continued thread",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:30.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "initial question" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:31.000Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "initial answer" },
+        }),
+        "",
+      ].join("\n"),
+    },
+    {
+      fileName: "rollout-continued-2.jsonl",
+      contents: [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: "continued",
+            cwd: "/tmp/continued",
+            source: "cli",
+            model_provider: "Spencer",
+            thread_name: "Continued thread",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:40.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "follow up question" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:41.000Z",
+          type: "event_msg",
+          payload: { type: "agent_message", message: "follow up answer" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-04-11T02:43:42.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "final question" },
+        }),
+        "",
+      ].join("\n"),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const secondPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-continued-2.jsonl");
+  writeFileSync(
+    secondPath,
+    [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "continued",
+          cwd: "/tmp/continued",
+          source: "cli",
+          model_provider: "Spencer",
+          thread_name: "Continued thread",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-11T02:43:40.000Z",
+        type: "event_msg",
+        payload: { type: "user_message", message: "follow up question" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-11T02:43:41.000Z",
+        type: "event_msg",
+        payload: { type: "agent_message", message: "follow up answer" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-11T02:43:42.000Z",
+        type: "event_msg",
+        payload: { type: "user_message", message: "final question" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-11T02:43:43.000Z",
+        type: "event_msg",
+        payload: { type: "agent_message", message: "final answer" },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const result = runCli(["--json", "open", "continued", "--format", "messages", "--full"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { messages: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.messages.map((message) => message.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+});
+
+test("state metadata changes refresh thread metadata without rebuilding messages", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const before = readIndexedThread(indexDb, "thread-epay-fix");
+  updateStateThread(join(sourceRoot, "state_5.sqlite"), "thread-epay-fix", {
+    title: "Clean metadata title",
+    updatedAt: 1_744_338_999_000,
+  });
+
+  const result = runCli(["--json", "recent", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  const after = readIndexedThread(indexDb, "thread-epay-fix");
+  expect(after?.title).toBe("Clean metadata title");
+  expect(after?.message_count).toBe(before?.message_count);
+  expect(after?.updated_at).toBe(1_744_338_999_000);
+});
+
+test("metadata-only sync respects archived changes from the state database", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  updateStateThread(join(sourceRoot, "state_5.sqlite"), "thread-epay-fix", {
+    updatedAt: 1_744_339_000_000,
+    archived: 1,
+  });
+
+  const result = runCli(["--json", "recent", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  expect(readIndexedThread(indexDb, "thread-epay-fix")?.archived).toBe(1);
+});
+
+test("unstable trailing JSON does not roll back an indexed thread", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const before = readIndexedThread(indexDb, "thread-epay-fix");
+  writeFileSync(
+    getDefaultSessionPath(sourceRoot),
+    `${fixtureSession}\n{"timestamp":"2026-04-11T05:20:00.000Z","type":"event_msg","payload":{"type":"assistant_message","message":"partial"`,
+    "utf8",
+  );
+
+  const result = runCli(["--json", "recent", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  const after = readIndexedThread(indexDb, "thread-epay-fix");
+  expect(after?.message_count).toBe(before?.message_count);
+  expect(after?.source_file).toBe(before?.source_file);
+});
+
+test("missing files are marked before they are deleted", () => {
+  const sourceRoot = makeSourceRootFromSessionFile(
+    "rollout-thread-missing.jsonl",
+    makeSessionJsonl({
+      threadId: "thread-missing",
+      title: "Thread Missing",
+      messages: [
+        {
+          timestamp: "2026-04-11T06:00:00.000Z",
+          role: "user",
+          text: "where did the file go",
+        },
+      ],
+    }),
+  );
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const sessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-missing.jsonl");
+  unlinkSync(sessionPath);
+
+  const firstPass = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(firstPass.status).toBe(0);
+  expect(readThreadCount(indexDb)).toBe(1);
+  expect(readIndexedThread(indexDb, "thread-missing")?.file_exists).toBe(0);
+
+  const secondPass = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(secondPass.status).toBe(0);
+  expect(readThreadCount(indexDb)).toBe(0);
 });
 
 test("find returns a compact unified result shape", () => {
@@ -651,7 +1102,7 @@ test("recent human output stays compact and normalizes second-based thread times
   expect(result.stdout).not.toContain("Fix epay callback normalize bug");
 });
 
-test("recent reads legacy second-based index timestamps correctly without refresh", () => {
+test("legacy second-based indexes are rebuilt into the current incremental schema on first sync", () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
   createLegacyReadyIndexDb(sourceRoot, indexDb, {
@@ -666,7 +1117,7 @@ test("recent reads legacy second-based index timestamps correctly without refres
     ok: true;
     data: { results: Array<Record<string, unknown>> };
   };
-  expect(payload.data.results[0]?.thread_id).toBe("legacy-seconds");
+  expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
   expect(payload.data.results[0]?.updated_at).toBe("2025-04-11T02:30:10.000Z");
 });
 
@@ -1492,7 +1943,140 @@ test("concurrent first-run queries wait on the rebuild lock instead of failing",
   }
 });
 
-test("ready indexes do not wait on a rebuild lock for read-only queries", async () => {
+test("read queries wait for an active rebuild lock and then succeed", async () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-active-lock-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const db = new Database(indexDb);
+  try {
+    db.exec("UPDATE threads SET message_count = 0");
+  } finally {
+    db.close();
+  }
+
+  const lockFile = `${indexDb}.lock`;
+  writeFileSync(lockFile, `999999 ${new Date().toISOString()}\n`, "utf8");
+
+  const releaseTimer = setTimeout(() => {
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the lock file has already been removed.
+    }
+  }, 16_000);
+
+  const startedAt = Date.now();
+  try {
+    const result = await runCliAsync(["--json", "find", "notify_url", "--kind", "message"], sourceRoot, indexDb);
+    expect(result.status).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(16_000);
+    const payload = JSON.parse(result.stdout) as {
+      ok: true;
+      data: { results: Array<Record<string, unknown>> };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+  } finally {
+    clearTimeout(releaseTimer);
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the file is already gone.
+    }
+  }
+}, 25_000);
+
+test("invalid ready indexes rebuild successfully when no lock file exists yet", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-invalid-ready-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const db = new Database(indexDb);
+  try {
+    db.exec("UPDATE threads SET message_count = 0");
+  } finally {
+    db.close();
+  }
+
+  const result = runCli(["--json", "find", "notify_url", "--kind", "message"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.ok).toBe(true);
+  expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+});
+
+test("default configured read-only queries fall back to a temporary writable index", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexHome = mkdtempSync(join(tmpdir(), "agent-threads-readonly-"));
+  const indexDb = join(indexHome, "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const db = new Database(indexDb);
+  try {
+    db.exec("UPDATE threads SET message_count = 0");
+  } finally {
+    db.close();
+  }
+
+  const configHome = mkdtempSync(join(tmpdir(), "agent-threads-config-"));
+  writeFileSync(
+    join(configHome, "config.json"),
+    `${JSON.stringify(
+      {
+        defaultSource: "local-codex",
+        indexDb,
+        sources: [
+          {
+            id: "local-codex",
+            kind: "codex",
+            root: sourceRoot,
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  chmodSync(indexHome, 0o555);
+  try {
+    const result = spawnSync(
+      "bun",
+      ["run", cliEntry, "--json", "find", "notify_url", "--kind", "message"],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          AGENT_THREADS_CONFIG_HOME: configHome,
+        },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    const payload = JSON.parse(result.stdout) as {
+      ok: true;
+      data: { results: Array<Record<string, unknown>> };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+  } finally {
+    chmodSync(indexHome, 0o755);
+  }
+});
+
+test("ready indexes skip the sync lock when the source manifest is unchanged", async () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(tmpdir(), `agent-threads-ready-index-${Date.now()}.sqlite`);
 
@@ -1510,16 +2094,180 @@ test("ready indexes do not wait on a rebuild lock for read-only queries", async 
 
   try {
     expect(raced.kind).toBe("done");
-    if (raced.kind === "done") {
-      expect(raced.result.status).toBe(0);
-      expect(JSON.parse(raced.result.stdout).ok).toBe(true);
-    }
   } finally {
     try {
       unlinkSync(lockFile);
     } catch {
       // Ignore cleanup races if the process already removed the lock file.
     }
-    await queryPromise;
+    const result = await queryPromise;
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).ok).toBe(true);
   }
+});
+
+test("multi-file threads keep the previous index when any sibling shard is unstable", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-continued-1.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "continued",
+        title: "Continued thread",
+        messages: [
+          {
+            timestamp: "2026-04-11T02:43:30.000Z",
+            role: "user",
+            text: "initial question",
+          },
+          {
+            timestamp: "2026-04-11T02:43:31.000Z",
+            role: "assistant",
+            text: "initial answer",
+          },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-continued-2.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "continued",
+        title: "Continued thread",
+        messages: [
+          {
+            timestamp: "2026-04-11T02:43:40.000Z",
+            role: "user",
+            text: "follow up question",
+          },
+          {
+            timestamp: "2026-04-11T02:43:41.000Z",
+            role: "assistant",
+            text: "follow up answer",
+          },
+        ],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "open", "continued", "--format", "messages", "--full"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+  const initialPayload = JSON.parse(initial.stdout) as {
+    ok: true;
+    data: { messages: Array<{ text: string }> };
+  };
+  expect(initialPayload.data.messages).toHaveLength(4);
+
+  const firstShardPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-continued-1.jsonl");
+  const secondShardPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-continued-2.jsonl");
+
+  writeFileSync(
+    firstShardPath,
+    makeSessionJsonl({
+      threadId: "continued",
+      title: "Continued thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T02:43:30.000Z",
+          role: "user",
+          text: "initial question",
+        },
+        {
+          timestamp: "2026-04-11T02:43:31.000Z",
+          role: "assistant",
+          text: "initial answer",
+        },
+        {
+          timestamp: "2026-04-11T02:43:32.000Z",
+          role: "assistant",
+          text: "new stable answer",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  writeFileSync(
+    secondShardPath,
+    `${makeSessionJsonl({
+      threadId: "continued",
+      title: "Continued thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T02:43:40.000Z",
+          role: "user",
+          text: "follow up question",
+        },
+        {
+          timestamp: "2026-04-11T02:43:41.000Z",
+          role: "assistant",
+          text: "follow up answer",
+        },
+        {
+          timestamp: "2026-04-11T02:43:42.000Z",
+          role: "user",
+          text: "partial incoming",
+        },
+      ],
+    })}\n{"timestamp":"2026-04-11T02:43:43.000Z","type":"event_msg","payload":{"type":"agent_message","message":"partial"`,
+    "utf8",
+  );
+
+  const whileUnstable = runCli(["--json", "open", "continued", "--format", "messages", "--full"], sourceRoot, indexDb);
+  expect(whileUnstable.status).toBe(0);
+  const unstablePayload = JSON.parse(whileUnstable.stdout) as {
+    ok: true;
+    data: { messages: Array<{ text: string }> };
+  };
+  expect(unstablePayload.data.messages.map((message) => message.text)).toEqual([
+    "initial question",
+    "initial answer",
+    "follow up question",
+    "follow up answer",
+  ]);
+
+  writeFileSync(
+    secondShardPath,
+    makeSessionJsonl({
+      threadId: "continued",
+      title: "Continued thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T02:43:40.000Z",
+          role: "user",
+          text: "follow up question",
+        },
+        {
+          timestamp: "2026-04-11T02:43:41.000Z",
+          role: "assistant",
+          text: "follow up answer",
+        },
+        {
+          timestamp: "2026-04-11T02:43:42.000Z",
+          role: "user",
+          text: "partial incoming",
+        },
+        {
+          timestamp: "2026-04-11T02:43:43.000Z",
+          role: "assistant",
+          text: "partial resolved",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  const afterRecovery = runCli(["--json", "open", "continued", "--format", "messages", "--full"], sourceRoot, indexDb);
+  expect(afterRecovery.status).toBe(0);
+  const recoveredPayload = JSON.parse(afterRecovery.stdout) as {
+    ok: true;
+    data: { messages: Array<{ text: string }> };
+  };
+  expect(recoveredPayload.data.messages.map((message) => message.text)).toEqual([
+    "initial question",
+    "initial answer",
+    "new stable answer",
+    "follow up question",
+    "follow up answer",
+    "partial incoming",
+    "partial resolved",
+  ]);
 });

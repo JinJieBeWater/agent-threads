@@ -24,9 +24,31 @@ ath find "error handling"
 
 By default, `ath` reads Codex history from `~/.codex` and stores its local index under `~/.agent-threads`.
 
+## Skill Layout
+
+This repository also ships a reusable `agent-threads` skill, but it is maintained as a normal repository artifact under `skills/agent-threads`, not under this project's `.codex/skills`.
+
+Use this layout as the source of truth:
+
+```text
+skills/
+  agent-threads/
+    SKILL.md
+    agents/openai.yaml
+```
+
+Recommended local install:
+
+```bash
+make install-skill-local
+ls -l ~/.agents/skills/agent-threads
+```
+
+Host-specific entrypoints such as `~/.codex/skills` should reference or mirror the global skill source when needed. This repository should not maintain the skill as a project-local `.codex` artifact.
+
 ## What It Does
 
-- Builds a local SQLite index from session history
+- Builds and incrementally syncs a local SQLite index from session history
 - Uses one search entrypoint for both threads and messages
 - Uses one open entrypoint for both whole threads and message-local context
 - Keeps source and index diagnostics under `inspect`
@@ -60,6 +82,14 @@ Use this executable:
 ```bash
 ath find "error handling"
 ```
+
+## Sync Model
+
+- Read commands auto-sync the local index before querying.
+- Normal sync is incremental at thread granularity: changed session files rebuild only their thread.
+- Unchanged source files are a no-op sync.
+- `ath admin reindex` remains the explicit full rebuild escape hatch.
+- If a session file is mid-write and its trailing JSON line is incomplete, `ath` keeps the existing indexed thread and retries on the next command.
 
 ## Recommended Flow
 
@@ -167,6 +197,7 @@ For a `codex` source, the CLI reads:
 cd /path/to/agent-threads
 bun install
 make install-local
+make install-skill-local
 command -v ath
 ath --json inspect source
 ```
@@ -190,6 +221,8 @@ bun run check
 ## Output Notes
 
 - The tool is read-only.
+- Read commands auto-sync source changes before returning results.
+- `--refresh` remains accepted for compatibility and still follows the incremental thread-level sync path during normal reads.
 - `--json` is compact by default. Use `--json-pretty` only when a human is inspecting raw output.
 - `find` returns a unified result stream with `kind`, `target`, and compact snippets.
 - `recent` lists threads by newest `updated_at` first and prints one compact summary line per thread.

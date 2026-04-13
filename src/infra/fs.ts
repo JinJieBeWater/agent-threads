@@ -1,5 +1,6 @@
 import { BunFileSystem } from "@effect/platform-bun";
 import * as FileSystem from "@effect/platform/FileSystem";
+import { writeFile } from "node:fs/promises";
 import { Effect, Option } from "effect";
 
 import { CliFailure } from "../errors.ts";
@@ -56,6 +57,23 @@ export function readModifiedTime(path: string): Effect.Effect<number | null, Cli
   ).pipe(Effect.provide(BunFileSystem.layer));
 }
 
+export function readFileStats(
+  path: string,
+): Effect.Effect<{ sizeBytes: number; mtimeMs: number | null }, CliFailure> {
+  return Effect.flatMap(FileSystem.FileSystem, (fs) =>
+    fs.stat(path).pipe(
+      Effect.map((info) => {
+        const mtime = Option.getOrUndefined(info.mtime);
+        return {
+          sizeBytes: Number(info.size ?? 0),
+          mtimeMs: mtime ? mtime.getTime() : null,
+        };
+      }),
+      Effect.mapError(fsError("fs-stat-failed", `Unable to stat path: ${path}`)),
+    ),
+  ).pipe(Effect.provide(BunFileSystem.layer));
+}
+
 export function removeFile(path: string): Effect.Effect<void, CliFailure> {
   return Effect.flatMap(FileSystem.FileSystem, (fs) =>
     fs.remove(path, { force: true }).pipe(
@@ -71,27 +89,26 @@ export function ensureParentDirectory(path: string): Effect.Effect<void, CliFail
 }
 
 export function writeExclusiveFile(path: string, contents: string): Effect.Effect<void, CliFailure> {
-  return Effect.flatMap(FileSystem.FileSystem, (fs) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const file = yield* fs.open(path, { flag: "wx" }).pipe(
-          Effect.mapError((error) => {
-            if (error._tag === "SystemError" && error.reason === "AlreadyExists") {
-              return new CliFailure({
-                code: "fs-already-exists",
-                message: `Path already exists: ${path}`,
-              });
-            }
-            return new CliFailure({
-              code: "fs-open-failed",
-              message: `Unable to open file: ${path}`,
-            });
-          }),
-        );
-        yield* file.writeAll(encoder.encode(contents)).pipe(
-          Effect.mapError(fsError("fs-write-failed", `Unable to write file: ${path}`)),
-        );
-      }),
-    ),
-  ).pipe(Effect.provide(BunFileSystem.layer));
+  return Effect.tryPromise({
+    try: async () => {
+      await writeFile(path, encoder.encode(contents), { flag: "wx" });
+    },
+    catch: (error) => {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "EEXIST"
+      ) {
+        return new CliFailure({
+          code: "fs-already-exists",
+          message: `Path already exists: ${path}`,
+        });
+      }
+      return new CliFailure({
+        code: "fs-open-failed",
+        message: `Unable to open file: ${path}`,
+      });
+    },
+  });
 }

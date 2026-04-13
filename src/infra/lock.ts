@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 
 import { CliFailure } from "../errors.ts";
-import { ensureParentDirectory, fileExists, readModifiedTime, removeFile, writeExclusiveFile } from "./fs.ts";
+import { ensureParentDirectory, fileExists, readFileString, readModifiedTime, removeFile, writeExclusiveFile } from "./fs.ts";
 import type { ResolvedPaths } from "../types.ts";
 
 const INDEX_LOCK_STALE_MS = 60_000;
@@ -13,39 +13,50 @@ function getIndexLockFile(paths: ResolvedPaths): string {
   return `${paths.indexDb}.lock`;
 }
 
-function pruneStaleIndexLock(lockFile: string): Effect.Effect<void> {
-  return readModifiedTime(lockFile).pipe(
-    Effect.catchAll(() => Effect.succeed(null)),
-    Effect.flatMap((modifiedTime) => {
-      if (modifiedTime === null) {
-        return Effect.void;
-      }
-      if (Date.now() - modifiedTime <= INDEX_LOCK_STALE_MS) {
-        return Effect.void;
-      }
-      return removeFile(lockFile).pipe(Effect.catchAll(() => Effect.void));
-    }),
-  );
-}
-
-function hasActiveIndexLock(paths: ResolvedPaths): Effect.Effect<boolean> {
-  const lockFile = getIndexLockFile(paths);
-  return Effect.gen(function* () {
-    const exists = yield* fileExists(lockFile).pipe(Effect.catchAll(() => Effect.succeed(false)));
-    if (!exists) {
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") {
       return false;
     }
-    yield* pruneStaleIndexLock(lockFile);
-    return yield* fileExists(lockFile).pipe(Effect.catchAll(() => Effect.succeed(false)));
+    return true;
+  }
+}
+
+function pruneStaleIndexLock(lockFile: string): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    const modifiedTime = yield* readModifiedTime(lockFile).pipe(Effect.catchAll(() => Effect.succeed(null)));
+    if (modifiedTime === null || Date.now() - modifiedTime <= INDEX_LOCK_STALE_MS) {
+      return;
+    }
+
+    const contents = yield* readFileString(lockFile).pipe(Effect.catchAll(() => Effect.succeed("")));
+    const pidToken = contents.trim().split(/\s+/, 1)[0] ?? "";
+    const pid = /^\d+$/.test(pidToken) ? Number(pidToken) : null;
+    if (pid !== null && isProcessAlive(pid)) {
+      return;
+    }
+
+    yield* removeFile(lockFile).pipe(Effect.catchAll(() => Effect.void));
   });
 }
 
 export function waitForUnlockedIndex(paths: ResolvedPaths): Effect.Effect<void> {
-  const loop = (): Effect.Effect<void> =>
-    hasActiveIndexLock(paths).pipe(
-      Effect.flatMap((locked) => (locked ? Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(Effect.flatMap(loop)) : Effect.void)),
+  const lockFile = getIndexLockFile(paths);
+
+  const wait = (): Effect.Effect<void> =>
+    pruneStaleIndexLock(lockFile).pipe(
+      Effect.flatMap(() => fileExists(lockFile).pipe(Effect.catchAll(() => Effect.succeed(false)))),
+      Effect.flatMap((exists) =>
+        exists
+          ? Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(Effect.flatMap(wait))
+          : Effect.void,
+      ),
     );
-  return loop();
+
+  return wait();
 }
 
 export function withIndexBuildLock<A>(
