@@ -228,6 +228,34 @@ make benchmark-baseline
 
 This writes a machine-readable snapshot under `benchmarks/` and you can keep a matching human summary under `docs/`.
 
+Two benchmark modes are useful:
+
+- Live source root:
+  runs directly against your current `~/.codex`, which reflects real usage but may be noisy if Codex is actively writing logs or session shards while the benchmark is running.
+- Static snapshot:
+  runs against a copied, frozen snapshot of `~/.codex`, which is better for measuring steady-state performance without source churn.
+
+To create a static source snapshot with a Bun-native helper:
+
+```bash
+make make-source-snapshot
+```
+
+Or with explicit paths:
+
+```bash
+bun scripts/make-source-snapshot.ts \
+  --source-root ~/.codex \
+  --output-root /tmp/ath-codex-snapshot
+```
+
+Then point the benchmark at that snapshot:
+
+```bash
+bun scripts/benchmark-baseline.ts \
+  --source-root /tmp/ath-codex-snapshot
+```
+
 Current performance notes:
 
 - Warm-path performance work now centers on keeping trusted-manifest sync cheap and selective.

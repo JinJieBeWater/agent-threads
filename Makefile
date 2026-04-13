@@ -1,4 +1,4 @@
-.PHONY: test typecheck lint check install-local install-skill-local benchmark-baseline
+.PHONY: test typecheck lint check install-local install-skill-local benchmark-baseline make-source-snapshot
 
 test:
 	bun test
@@ -23,3 +23,6 @@ install-skill-local:
 
 benchmark-baseline:
 	bun scripts/benchmark-baseline.ts
+
+make-source-snapshot:
+	bun scripts/make-source-snapshot.ts

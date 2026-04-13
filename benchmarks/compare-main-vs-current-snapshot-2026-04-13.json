@@ -1,0 +1,34 @@
+{
+  "capturedAt": "2026-04-13T14:08:00.000Z",
+  "sourceRoot": "/tmp/ath-codex-snapshot-1776076381",
+  "samplesPerCase": {
+    "cold": 1,
+    "warm": 1
+  },
+  "branches": {
+    "main": {
+      "commit": "d7027fee0ffa4bd16618ff63c0fa9bbd14f58722",
+      "results": {
+        "cold_inspect_index": 6104.59,
+        "warm_inspect_index": 6892.02,
+        "warm_recent_limit_20": 6862.71,
+        "warm_find_message_notify_url": 9970.06,
+        "warm_find_message_payment": 9798.05,
+        "warm_find_message_epay_callback": 7187.83,
+        "admin_reindex": 5603.62
+      }
+    },
+    "current": {
+      "branch": "wip-ath-trigram-index",
+      "results": {
+        "cold_inspect_index": 6670.61,
+        "warm_inspect_index": 1195.44,
+        "warm_recent_limit_20": 244.76,
+        "warm_find_message_notify_url": 291.68,
+        "warm_find_message_payment": 297.92,
+        "warm_find_message_epay_callback": 299.51,
+        "admin_reindex": 11960.93
+      }
+    }
+  }
+}
