@@ -1,0 +1,246 @@
+{
+  "capturedAt": "2026-04-13T04:29:34.172Z",
+  "cliEntry": "/Users/jinjiebewater/my/personal/projects/vibe/agent-threads/src/index.ts",
+  "sourceRoot": "/Users/jinjiebewater/.codex",
+  "benchmarkRoot": "/var/folders/7x/xyhxw7bx4bb25l_whqpdjzx80000gn/T/ath-benchmark-8q7dQ3",
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "bunVersion": "1.3.11",
+    "cpuModel": "Apple M5",
+    "cpuCount": 10,
+    "totalMemoryBytes": 25769803776,
+    "systemUptimeSeconds": 0
+  },
+  "dataset": {
+    "threadCount": 963,
+    "messageCount": 40627,
+    "indexedMessageCount": 40627,
+    "sourceBuiltAt": "2026-04-13T04:27:30.276Z"
+  },
+  "warmIndexArtifacts": {
+    "indexDbBytes": 185417728,
+    "walBytes": 603683032,
+    "shmBytes": 1179648
+  },
+  "notes": [
+    "All command timings are end-to-end CLI wall-clock measurements.",
+    "Warm-command timings still include ensureIndex() and its no-op sync preflight.",
+    "Cold inspect-index timings include initial schema setup and index build into a fresh temp SQLite file.",
+    "The benchmark uses the caller's current source root and a temp benchmark index, so it does not mutate ~/.agent-threads/index.sqlite."
+  ],
+  "cases": [
+    {
+      "name": "cold_inspect_index",
+      "description": "First read on an empty temp index; includes initial index build.",
+      "command": [
+        "inspect",
+        "index"
+      ],
+      "mode": "cold",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 3351.37
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 3261.47
+        }
+      ],
+      "summary": {
+        "minMs": 3261.47,
+        "medianMs": 3306.42,
+        "meanMs": 3306.42,
+        "maxMs": 3351.37
+      }
+    },
+    {
+      "name": "warm_inspect_index",
+      "description": "Read-only stats on a warm index; includes no-op sync preflight.",
+      "command": [
+        "inspect",
+        "index"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 7230.75
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 6564.05
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 6609.24
+        }
+      ],
+      "summary": {
+        "minMs": 6564.05,
+        "medianMs": 6609.24,
+        "meanMs": 6801.35,
+        "maxMs": 7230.75
+      }
+    },
+    {
+      "name": "warm_recent_limit_20",
+      "description": "Recent threads listing on a warm index.",
+      "command": [
+        "recent",
+        "--limit",
+        "20"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 6619.5
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 6660.47
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 6802.44
+        }
+      ],
+      "summary": {
+        "minMs": 6619.5,
+        "medianMs": 6660.47,
+        "meanMs": 6694.14,
+        "maxMs": 6802.44
+      }
+    },
+    {
+      "name": "warm_find_message_notify_url",
+      "description": "Identifier-style message search on a warm index.",
+      "command": [
+        "find",
+        "notify_url",
+        "--kind",
+        "message",
+        "--limit",
+        "20"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 7362.4
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 7189.22
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 7052.5
+        }
+      ],
+      "summary": {
+        "minMs": 7052.5,
+        "medianMs": 7189.22,
+        "meanMs": 7201.37,
+        "maxMs": 7362.4
+      }
+    },
+    {
+      "name": "warm_find_message_payment",
+      "description": "High-frequency English token search on a warm index.",
+      "command": [
+        "find",
+        "payment",
+        "--kind",
+        "message",
+        "--limit",
+        "20"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 7220.17
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 7219.67
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 7194.52
+        }
+      ],
+      "summary": {
+        "minMs": 7194.52,
+        "medianMs": 7219.67,
+        "meanMs": 7211.45,
+        "maxMs": 7220.17
+      }
+    },
+    {
+      "name": "warm_find_message_epay_callback",
+      "description": "Two-token phrase-style search on a warm index.",
+      "command": [
+        "find",
+        "epay callback",
+        "--kind",
+        "message",
+        "--limit",
+        "20"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 7253.53
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 7476.82
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 7288.72
+        }
+      ],
+      "summary": {
+        "minMs": 7253.53,
+        "medianMs": 7288.72,
+        "meanMs": 7339.69,
+        "maxMs": 7476.82
+      }
+    },
+    {
+      "name": "admin_reindex",
+      "description": "Explicit full rebuild against an existing temp index.",
+      "command": [
+        "admin",
+        "reindex"
+      ],
+      "mode": "warm",
+      "samples": [
+        {
+          "sample": 1,
+          "elapsedMs": 3398.29
+        },
+        {
+          "sample": 2,
+          "elapsedMs": 3505.72
+        },
+        {
+          "sample": 3,
+          "elapsedMs": 3506.05
+        }
+      ],
+      "summary": {
+        "minMs": 3398.29,
+        "medianMs": 3505.72,
+        "meanMs": 3470.02,
+        "maxMs": 3506.05
+      }
+    }
+  ]
+}

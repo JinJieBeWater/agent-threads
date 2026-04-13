@@ -1,0 +1,32 @@
+{
+  "capturedAt": "2026-04-13T10:51:00.000Z",
+  "implementation": "phase1 words-first fts with log-aware selective sync",
+  "sourceRoot": "/Users/jinjiebewater/.codex",
+  "results": [
+    {
+      "name": "cold_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 12750.95
+    },
+    {
+      "name": "warm_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 1079.04
+    },
+    {
+      "name": "warm_find_message_notify_url",
+      "command": ["find", "notify_url", "--kind", "message", "--limit", "20"],
+      "elapsedMs": 293.87
+    },
+    {
+      "name": "warm_find_message_payment",
+      "command": ["find", "payment", "--kind", "message", "--limit", "20"],
+      "elapsedMs": 279.53
+    },
+    {
+      "name": "admin_reindex",
+      "command": ["admin", "reindex"],
+      "elapsedMs": 16451.07
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "capturedAt": "2026-04-13T10:10:00.000Z",
+  "implementation": "phase1 words-first fts",
+  "sourceRoot": "/Users/jinjiebewater/.codex",
+  "notes": [
+    "Targeted serial benchmark run on a fresh temp index.",
+    "This file records the minimal command set needed to compare the current Phase 1 implementation against the existing pre-FTS baseline.",
+    "A prior parallel attempt against the same temp index was discarded due to SQLite lock contention."
+  ],
+  "results": [
+    {
+      "name": "cold_inspect_index",
+      "command": [
+        "inspect",
+        "index"
+      ],
+      "elapsedMs": 15429.45
+    },
+    {
+      "name": "warm_inspect_index",
+      "command": [
+        "inspect",
+        "index"
+      ],
+      "elapsedMs": 84286.08
+    },
+    {
+      "name": "warm_find_message_notify_url",
+      "command": [
+        "find",
+        "notify_url",
+        "--kind",
+        "message",
+        "--limit",
+        "20"
+      ],
+      "elapsedMs": 107174.87
+    },
+    {
+      "name": "warm_find_message_payment",
+      "command": [
+        "find",
+        "payment",
+        "--kind",
+        "message",
+        "--limit",
+        "20"
+      ],
+      "elapsedMs": 97739.23
+    },
+    {
+      "name": "admin_reindex",
+      "command": [
+        "admin",
+        "reindex"
+      ],
+      "elapsedMs": 28009.25
+    }
+  ],
+  "baselineReference": {
+    "doc": "docs/performance-baseline-2026-04-13.md",
+    "cold_inspect_index_median_ms": 3306,
+    "warm_inspect_index_median_ms": 6609,
+    "warm_find_message_notify_url_median_ms": 7189,
+    "warm_find_message_payment_median_ms": 7220,
+    "admin_reindex_median_ms": 3506
+  }
+}

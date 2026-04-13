@@ -2,9 +2,9 @@ import { basename } from "node:path";
 import { Effect } from "effect";
 
 import type { CliFailure } from "../errors.ts";
-import { fileExists, readDirectory, readFileString } from "../infra/fs.ts";
-import { all, withDatabase } from "../infra/sqlite.ts";
-import type { MessageRecord, ParsedSessionFile, ThreadRecord } from "../types.ts";
+import { fileExists, readDirectory, readFileStats, readFileString, readModifiedTime } from "../infra/fs.ts";
+import { all, get, withDatabase } from "../infra/sqlite.ts";
+import type { MessageRecord, ParsedSessionFile, ResolvedPaths, ThreadRecord } from "../types.ts";
 
 const ROLLOUT_THREAD_ID_PATTERN =
   /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
@@ -134,6 +134,15 @@ function readEpochMilliseconds(value: unknown): number | null {
 
 type ParsedMessageDraft = Omit<MessageRecord, "threadId" | "messageRef">;
 
+function hashString(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return String(hash >>> 0);
+}
+
 export function chooseThreadTitle(input: {
   stateTitle?: string | null;
   sessionTitle?: string | null;
@@ -195,6 +204,86 @@ export function walkJsonlFiles(root: string): Effect.Effect<string[], CliFailure
     result.sort((left, right) => left.localeCompare(right));
     return result;
   });
+}
+
+export function readSourceFingerprint(paths: ResolvedPaths): Effect.Effect<string | null, CliFailure> {
+  return Effect.gen(function* () {
+    const sessionIndexExists = yield* fileExists(paths.sessionIndex);
+    if (!sessionIndexExists) {
+      return null;
+    }
+
+    const sessionIndexStats = yield* readFileStats(paths.sessionIndex);
+    if (sessionIndexStats.sizeBytes <= 0) {
+      return null;
+    }
+    const sessionIndexContents = yield* readFileString(paths.sessionIndex);
+
+    const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
+    const archivedSessionsDirExists = yield* fileExists(paths.archivedSessionsDir);
+    const archivedSessionsDirMtime = archivedSessionsDirExists
+      ? yield* readModifiedTime(paths.archivedSessionsDir).pipe(Effect.catchAll(() => Effect.succeed(null)))
+      : null;
+
+    return JSON.stringify({
+      version: 1,
+      stateDbMtimeMs: Math.floor(stateDbMtime ?? 0),
+      sessionIndexSizeBytes: sessionIndexStats.sizeBytes,
+      sessionIndexMtimeMs: Math.floor(sessionIndexStats.mtimeMs ?? 0),
+      sessionIndexHash: hashString(sessionIndexContents),
+      archivedSessionsDirMtimeMs: Math.floor(archivedSessionsDirMtime ?? 0),
+    });
+  });
+}
+
+export function hasTrustedHostManifest(paths: ResolvedPaths): Effect.Effect<boolean, CliFailure> {
+  return Effect.gen(function* () {
+    const sessionIndexExists = yield* fileExists(paths.sessionIndex);
+    const logsDbExists = yield* fileExists(paths.logsDb);
+    if (!sessionIndexExists || !logsDbExists) {
+      return false;
+    }
+
+    const sessionIndexStats = yield* readFileStats(paths.sessionIndex);
+    const logsDbStats = yield* readFileStats(paths.logsDb);
+    return sessionIndexStats.sizeBytes > 0 && logsDbStats.sizeBytes > 0;
+  });
+}
+
+export function readLogsHighWater(paths: ResolvedPaths): Effect.Effect<number | null, CliFailure> {
+  return Effect.gen(function* () {
+    const trustedManifest = yield* hasTrustedHostManifest(paths);
+    if (!trustedManifest) {
+      return null;
+    }
+
+    return yield* withDatabase(paths.logsDb, (db) =>
+      get<{ max_id: number | null }>(db, `SELECT MAX(id) AS max_id FROM logs`).pipe(
+        Effect.map((row) => {
+          const maxId = Number(row?.max_id ?? 0);
+          return Number.isFinite(maxId) ? maxId : 0;
+        }),
+        Effect.catchAll(() => Effect.succeed<number | null>(null)),
+      ),
+    );
+  });
+}
+
+export function readActiveThreadIdsSince(paths: ResolvedPaths, lastLogIdExclusive: number): Effect.Effect<string[], CliFailure> {
+  return withDatabase(paths.logsDb, (db) =>
+    all<{ thread_id: string | null }>(
+      db,
+      `
+        SELECT DISTINCT thread_id
+        FROM logs
+        WHERE id > ? AND thread_id IS NOT NULL AND thread_id != ''
+      `,
+      lastLogIdExclusive,
+    ).pipe(
+      Effect.map((rows) => rows.map((row) => String(row.thread_id)).sort((left, right) => left.localeCompare(right))),
+      Effect.catchAll(() => Effect.succeed([])),
+    ),
+  );
 }
 
 export function readStateThreads(stateDbPath: string): Effect.Effect<Map<string, ThreadRecord>, CliFailure> {

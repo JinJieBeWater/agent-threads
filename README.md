@@ -218,6 +218,25 @@ bun run check
 
 `bun run check` runs typecheck, lint, and tests together.
 
+## Benchmarking
+
+To capture an end-to-end CLI baseline against your current local Codex history:
+
+```bash
+make benchmark-baseline
+```
+
+This writes a machine-readable snapshot under `benchmarks/` and you can keep a matching human summary under `docs/`.
+
+Current performance notes:
+
+- Warm-path performance work now centers on keeping trusted-manifest sync cheap and selective.
+- If rebuild or cold-start latency becomes the next bottleneck, start with SQLite FTS5
+  bulk-load / merge / optimize experiments before touching the steady-state query path.
+- See the phase-specific notes under `docs/`, especially:
+  - `docs/performance-phase1-live-final-2026-04-13.md`
+  - `docs/performance-phase1-cold-post-batch-2026-04-13.md`
+
 ## Output Notes
 
 - The tool is read-only.

@@ -1,0 +1,84 @@
+{
+  "capturedAt": "2026-04-13T10:43:42.880Z",
+  "sourceRoot": "/Users/jinjiebewater/.codex",
+  "indexDb": "/tmp/ath-phase1-profile.sqlite",
+  "sourceFingerprintBefore": "{\"version\":1,\"stateDbMtimeMs\":1776076416069,\"sessionIndexSizeBytes\":21024,\"sessionIndexMtimeMs\":1776052190795,\"sessionIndexHash\":\"2126678333\",\"archivedSessionsDirMtimeMs\":1775982664316}",
+  "sourceFingerprintAfter": "{\"version\":1,\"stateDbMtimeMs\":1776076416069,\"sessionIndexSizeBytes\":21024,\"sessionIndexMtimeMs\":1776052190795,\"sessionIndexHash\":\"2126678333\",\"archivedSessionsDirMtimeMs\":1775982664316}",
+  "samples": [
+    {
+      "name": "rebuildIndexUnlocked",
+      "elapsedMs": 10664.71,
+      "details": {
+        "builtAt": "2026-04-13T10:43:36.165Z",
+        "threadCount": 1001,
+        "messageCount": 42699,
+        "activeSessionFileCount": 1001,
+        "archivedSessionFileCount": 0
+      }
+    },
+    {
+      "name": "canSkipIncrementalSync",
+      "elapsedMs": 183.17,
+      "details": {
+        "canSkip": false
+      }
+    },
+    {
+      "name": "ensureIndex",
+      "elapsedMs": 385.2
+    },
+    {
+      "name": "getThreadStats",
+      "elapsedMs": 3.29,
+      "details": {
+        "thread_count": 1001,
+        "message_count": 42699
+      }
+    },
+    {
+      "name": "searchMessages_notify_url",
+      "elapsedMs": 7.74,
+      "details": {
+        "resultCount": 20
+      }
+    },
+    {
+      "name": "searchMessages_payment",
+      "elapsedMs": 6.53,
+      "details": {
+        "resultCount": 20
+      }
+    }
+  ],
+  "rawInspectQueries": [
+    {
+      "name": "inspect_query_messages_table",
+      "elapsedMs": 0.12
+    },
+    {
+      "name": "inspect_query_totals",
+      "elapsedMs": 1.84
+    },
+    {
+      "name": "inspect_query_message_count",
+      "elapsedMs": 0.22
+    },
+    {
+      "name": "inspect_query_providers",
+      "elapsedMs": 0.05
+    },
+    {
+      "name": "inspect_query_top_cwds",
+      "elapsedMs": 0.09
+    },
+    {
+      "name": "inspect_query_meta",
+      "elapsedMs": 0.01
+    }
+  ],
+  "artifacts": {
+    "indexDbBytes": 248446976,
+    "walBytes": 30953592,
+    "shmBytes": 491520
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "capturedAt": "2026-04-13T10:34:16.000Z",
+  "implementation": "phase1 words-first fts on static source snapshot",
+  "sourceRoot": "/tmp/ath-codex-snapshot-1776076381",
+  "results": [
+    {
+      "name": "cold_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 31224.11
+    },
+    {
+      "name": "warm_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 603.3
+    },
+    {
+      "name": "warm_find_message_notify_url",
+      "command": ["find", "notify_url", "--kind", "message", "--limit", "20"],
+      "elapsedMs": 335.65
+    },
+    {
+      "name": "warm_find_message_payment",
+      "command": ["find", "payment", "--kind", "message", "--limit", "20"],
+      "elapsedMs": 346.15
+    },
+    {
+      "name": "admin_reindex",
+      "command": ["admin", "reindex"],
+      "elapsedMs": 14208.82
+    }
+  ]
+}

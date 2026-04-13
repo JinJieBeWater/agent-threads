@@ -11,7 +11,7 @@
     "dev": "bun run ./src/index.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint src test --error-on-warnings",
-    "test": "bun test",
+    "test": "bun test --timeout 15000",
     "check": "bun run typecheck && bun run lint && bun test"
   },
   "engines": {

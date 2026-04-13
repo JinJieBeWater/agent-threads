@@ -1,0 +1,52 @@
+{
+  "capturedAt": "2026-04-13T04:56:00.000Z",
+  "type": "post-implementation-smoke-check",
+  "implementation": "messages_fts trigram prototype",
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpuModel": "Apple M5",
+    "cpuCount": 10,
+    "bunVersion": "1.3.11"
+  },
+  "dataset": {
+    "sourceRoot": "/Users/jinjiebewater/.codex",
+    "indexDb": "/tmp/ath-post-impl.sqlite"
+  },
+  "method": {
+    "notes": [
+      "Targeted end-to-end CLI timings collected after the trigram implementation landed.",
+      "A fresh temp index was created first, then subsequent commands reused the same temp index.",
+      "This is intentionally a smoke check, not a full comparison run, because the implementation already showed severe latency regression."
+    ],
+    "commands": [
+      {
+        "name": "cold_inspect_index",
+        "command": "bun run src/index.ts --json --source-root ~/.codex --index-db /tmp/ath-post-impl.sqlite inspect index",
+        "realSeconds": 24.13
+      },
+      {
+        "name": "warm_inspect_index",
+        "command": "bun run src/index.ts --json --source-root ~/.codex --index-db /tmp/ath-post-impl.sqlite inspect index",
+        "realSeconds": 198.13
+      },
+      {
+        "name": "warm_find_message_notify_url",
+        "command": "bun run src/index.ts --json --source-root ~/.codex --index-db /tmp/ath-post-impl.sqlite find notify_url --kind message --limit 20",
+        "realSeconds": 257.21
+      }
+    ]
+  },
+  "comparisonAgainstBaseline": {
+    "coldInspectMedianMs": 3306.42,
+    "warmInspectMedianMs": 6609.24,
+    "warmFindNotifyUrlMedianMs": 7189.22,
+    "postImplColdInspectMs": 24130,
+    "postImplWarmInspectMs": 198130,
+    "postImplWarmFindNotifyUrlMs": 257210
+  },
+  "conclusion": {
+    "status": "regressed",
+    "summary": "The current trigram prototype regresses end-to-end CLI latency by a large margin and should not be considered performance-positive in its current form."
+  }
+}

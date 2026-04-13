@@ -1,4 +1,4 @@
-.PHONY: test typecheck lint check install-local install-skill-local
+.PHONY: test typecheck lint check install-local install-skill-local benchmark-baseline
 
 test:
 	bun test
@@ -20,3 +20,6 @@ install-local:
 install-skill-local:
 	mkdir -p "$(HOME)/.agents/skills"
 	ln -sfn "$(PWD)/skills/agent-threads" "$(HOME)/.agents/skills/agent-threads"
+
+benchmark-baseline:
+	bun scripts/benchmark-baseline.ts

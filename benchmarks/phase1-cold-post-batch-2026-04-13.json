@@ -1,0 +1,22 @@
+{
+  "capturedAt": "2026-04-13T11:10:00.000Z",
+  "implementation": "phase1 words-first fts with selective sync and rebuild fts backfill",
+  "sourceRoot": "/Users/jinjiebewater/.codex",
+  "notes": [
+    "Targeted cold-path measurement after switching full rebuild to messages-table insert plus whole-table FTS backfill.",
+    "Later tuning increased bulk insert chunk sizes and kept the same rebuild shape; the timings below reflect the current best stable cold-path numbers on the current code.",
+    "This record isolates cold inspect and explicit reindex only."
+  ],
+  "results": [
+    {
+      "name": "cold_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 6123.33
+    },
+    {
+      "name": "admin_reindex",
+      "command": ["admin", "reindex"],
+      "elapsedMs": 5631.36
+    }
+  ]
+}

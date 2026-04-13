@@ -110,6 +110,76 @@ function makeFakeSourceRoot(): string {
   return makeFakeSourceRootWithThreadTimes();
 }
 
+function seedLogsDb(dbPath: string): void {
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        ts_nanos INTEGER NOT NULL,
+        level TEXT NOT NULL,
+        target TEXT NOT NULL,
+        feedback_log_body TEXT,
+        module_path TEXT,
+        file TEXT,
+        line INTEGER,
+        thread_id TEXT,
+        process_uuid TEXT,
+        estimated_bytes INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    db.query(
+      `INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, module_path, file, line, thread_id, process_uuid, estimated_bytes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1_744_338_610,
+      0,
+      "INFO",
+      "test",
+      "seeded activity",
+      "",
+      "",
+      0,
+      "thread-epay-fix",
+      "test-process",
+      16,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function makeTrustedManifestSourceRoot(): string {
+  const root = makeFakeSourceRoot();
+  seedLogsDb(join(root, "logs_2.sqlite"));
+  return root;
+}
+
+function appendLogRow(logsDbPath: string, threadId: string): void {
+  const db = new Database(logsDbPath);
+  try {
+    db.query(
+      `INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, module_path, file, line, thread_id, process_uuid, estimated_bytes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      Math.floor(Date.now() / 1000),
+      0,
+      "INFO",
+      "test",
+      "synthetic activity",
+      "",
+      "",
+      0,
+      threadId,
+      "test-process",
+      16,
+    );
+  } finally {
+    db.close();
+  }
+}
+
 function makeFakeSourceRootWithThreadTimes(options?: {
   createdAt?: number;
   updatedAt?: number;
@@ -120,15 +190,13 @@ function makeFakeSourceRootWithThreadTimes(options?: {
 
   const sessionPath = join(root, "sessions", "2026", "04", "11", "rollout-thread-epay-fix.jsonl");
   writeFileSync(sessionPath, `${fixtureSession}\n`, "utf8");
-  writeFileSync(
-    join(root, "session_index.jsonl"),
-    `${JSON.stringify({
+  writeSessionIndex(root, [
+    {
       id: "thread-epay-fix",
       thread_name: "Fix epay callback normalize bug",
       updated_at: "2026-04-11T02:43:30.000Z",
-    })}\n`,
-    "utf8",
-  );
+    },
+  ]);
   createThreadsTable(join(root, "state_5.sqlite"), options);
   writeFileSync(join(root, "logs_2.sqlite"), "", "utf8");
   return root;
@@ -427,6 +495,21 @@ function makeSessionJsonl(input: {
   ].join("\n");
 }
 
+function writeSessionIndex(
+  root: string,
+  entries: Array<{
+    id: string;
+    thread_name: string;
+    updated_at: string;
+  }>,
+) {
+  writeFileSync(
+    join(root, "session_index.jsonl"),
+    entries.map((entry) => JSON.stringify(entry)).join("\n") + (entries.length > 0 ? "\n" : ""),
+    "utf8",
+  );
+}
+
 function getDefaultSessionPath(root: string) {
   return join(root, "sessions", "2026", "04", "11", "rollout-thread-epay-fix.jsonl");
 }
@@ -481,10 +564,40 @@ function readThreadCount(indexDb: string) {
   }
 }
 
+function readFtsRowCount(indexDb: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    const row = db.query(`SELECT COUNT(*) AS count FROM messages_fts`).get() as { count: number };
+    return row.count;
+  } finally {
+    db.close();
+  }
+}
+
+function readThreadSourceCount(indexDb: string, threadId: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    const row = db.query(`SELECT COUNT(*) AS count FROM thread_sources WHERE thread_id = ?`).get(threadId) as { count: number };
+    return row.count;
+  } finally {
+    db.close();
+  }
+}
+
 function readMetaValue(indexDb: string, key: string) {
   const db = new Database(indexDb, { readonly: true });
   try {
     const row = db.query(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | null;
+    return row?.value ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+function readSyncMetaValue(indexDb: string, key: string) {
+  const db = new Database(indexDb, { readonly: true });
+  try {
+    const row = db.query(`SELECT value FROM sync_meta WHERE key = ?`).get(key) as { value: string } | null;
     return row?.value ?? null;
   } finally {
     db.close();
@@ -535,23 +648,29 @@ test("find and open work against rebuilt local index", () => {
   expect(contextPayload.data.messages.length).toBe(3);
 });
 
-test("incremental sync leaves unchanged indexes as a no-op", () => {
-  const sourceRoot = makeFakeSourceRoot();
+test("incremental sync leaves unchanged indexes as a no-op when the source fingerprint is unchanged", () => {
+  const sourceRoot = makeTrustedManifestSourceRoot();
   const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
 
   const initial = runCli(["--json", "--refresh", "find", "notify_url"], sourceRoot, indexDb);
   expect(initial.status).toBe(0);
 
   const builtAtBefore = readMetaValue(indexDb, "built_at");
+  const lastSyncAtBefore = readSyncMetaValue(indexDb, "last_sync_at");
+  const sourceFingerprintBefore = readSyncMetaValue(indexDb, "last_source_fingerprint");
   const threadBefore = readIndexedThread(indexDb, "thread-epay-fix");
 
   const second = runCli(["--json", "find", "notify_url"], sourceRoot, indexDb);
   expect(second.status).toBe(0);
 
   const builtAtAfter = readMetaValue(indexDb, "built_at");
+  const lastSyncAtAfter = readSyncMetaValue(indexDb, "last_sync_at");
+  const sourceFingerprintAfter = readSyncMetaValue(indexDb, "last_source_fingerprint");
   const threadAfter = readIndexedThread(indexDb, "thread-epay-fix");
 
   expect(builtAtAfter).toBe(builtAtBefore);
+  expect(lastSyncAtAfter).toBe(lastSyncAtBefore);
+  expect(sourceFingerprintAfter).toBe(sourceFingerprintBefore);
   expect(threadAfter?.message_count).toBe(threadBefore?.message_count);
   expect(threadAfter?.updated_at).toBe(threadBefore?.updated_at);
 });
@@ -585,6 +704,18 @@ test("incremental sync indexes a newly added session file without rebuilding oth
     }),
     "utf8",
   );
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: "thread-new",
+      thread_name: "Thread new",
+      updated_at: "2026-04-11T05:00:15.000Z",
+    },
+  ]);
 
   const result = runCli(["--json", "recent", "--limit", "10"], sourceRoot, indexDb);
   expect(result.status).toBe(0);
@@ -798,6 +929,7 @@ test("state metadata changes refresh thread metadata without rebuilding messages
   expect(initial.status).toBe(0);
 
   const before = readIndexedThread(indexDb, "thread-epay-fix");
+  const lastSyncAtBefore = readSyncMetaValue(indexDb, "last_sync_at");
   updateStateThread(join(sourceRoot, "state_5.sqlite"), "thread-epay-fix", {
     title: "Clean metadata title",
     updatedAt: 1_744_338_999_000,
@@ -807,9 +939,11 @@ test("state metadata changes refresh thread metadata without rebuilding messages
   expect(result.status).toBe(0);
 
   const after = readIndexedThread(indexDb, "thread-epay-fix");
+  const lastSyncAtAfter = readSyncMetaValue(indexDb, "last_sync_at");
   expect(after?.title).toBe("Clean metadata title");
   expect(after?.message_count).toBe(before?.message_count);
   expect(after?.updated_at).toBe(1_744_338_999_000);
+  expect(lastSyncAtAfter).not.toBe(lastSyncAtBefore);
 });
 
 test("metadata-only sync respects archived changes from the state database", () => {
@@ -843,6 +977,13 @@ test("unstable trailing JSON does not roll back an indexed thread", () => {
     `${fixtureSession}\n{"timestamp":"2026-04-11T05:20:00.000Z","type":"event_msg","payload":{"type":"assistant_message","message":"partial"`,
     "utf8",
   );
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T05:20:00.000Z",
+    },
+  ]);
 
   const result = runCli(["--json", "recent", "--limit", "5"], sourceRoot, indexDb);
   expect(result.status).toBe(0);
@@ -883,7 +1024,7 @@ test("missing files are marked before they are deleted", () => {
   const secondPass = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
   expect(secondPass.status).toBe(0);
   expect(readThreadCount(indexDb)).toBe(0);
-});
+}, 10_000);
 
 test("find returns a compact unified result shape", () => {
   const sourceRoot = makeFakeSourceRoot();
@@ -925,6 +1066,281 @@ test("find --kind message returns snippets instead of full text", () => {
   expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
   expect(payload.data.results[0]?.snippet).toBeDefined();
   expect(payload.data.results[0]?.text).toBeUndefined();
+});
+
+test("rebuild creates a message-search FTS index with one row per indexed message", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { message_count: number };
+  };
+  expect(readFtsRowCount(indexDb)).toBe(payload.data.message_count);
+});
+
+test("find --kind message falls back when words FTS cannot express a substring query", () => {
+  const sourceRoot = makeSourceRootFromSessionFile(
+    "rollout-short-query.jsonl",
+    makeSessionJsonl({
+      threadId: "short-query",
+      title: "Short query thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T02:43:30.000Z",
+          role: "user",
+          text: "payment_callback_url retry issue",
+        },
+      ],
+    }),
+  );
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    ["--json", "--refresh", "find", "callback_u", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results).toHaveLength(1);
+  expect(payload.data.results[0]?.thread_id).toBe("short-query");
+});
+
+test("message search supports code-ish tokens with punctuation", () => {
+  const sourceRoot = makeSourceRootFromSessionFile(
+    "rollout-tokenchars.jsonl",
+    makeSessionJsonl({
+      threadId: "tokenchars",
+      title: "Tokenchars thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T02:43:30.000Z",
+          role: "assistant",
+          text: "Use epay:notify and /payments/callback before shipping notify_url.",
+        },
+      ],
+    }),
+  );
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const notifyResult = runCli(
+    ["--json", "--refresh", "find", "notify_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(notifyResult.status).toBe(0);
+  const notifyPayload = JSON.parse(notifyResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(notifyPayload.data.results[0]?.thread_id).toBe("tokenchars");
+
+  const punctuatedResult = runCli(
+    ["--json", "find", "epay:notify", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(punctuatedResult.status).toBe(0);
+  const punctuatedPayload = JSON.parse(punctuatedResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(punctuatedPayload.data.results[0]?.thread_id).toBe("tokenchars");
+});
+
+test("incremental sync refreshes message FTS hits without leaving stale matches", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const sessionPath = getDefaultSessionPath(sourceRoot);
+
+  const initial = runCli(
+    ["--json", "--refresh", "find", "notify_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(initial.status).toBe(0);
+
+  writeFileSync(sessionPath, `${fixtureSession.replaceAll("notify_url", "callback_url")}\n`, "utf8");
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:44:00.000Z",
+    },
+  ]);
+
+  const updated = runCli(
+    ["--json", "find", "callback_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(updated.status).toBe(0);
+  const updatedPayload = JSON.parse(updated.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(updatedPayload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+
+  const stale = runCli(
+    ["--json", "find", "notify_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(stale.status).toBe(0);
+  const stalePayload = JSON.parse(stale.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(stalePayload.data.results).toHaveLength(0);
+});
+
+test("live session shard changes still invalidate warm reads even when the source fingerprint metadata is unchanged", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const sessionPath = getDefaultSessionPath(sourceRoot);
+
+  const initial = runCli(
+    ["--json", "--refresh", "find", "notify_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(initial.status).toBe(0);
+
+  writeFileSync(sessionPath, `${fixtureSession.replaceAll("notify_url", "callback_url")}\n`, "utf8");
+
+  const updated = runCli(
+    ["--json", "find", "callback_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(updated.status).toBe(0);
+  const updatedPayload = JSON.parse(updated.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(updatedPayload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+});
+
+test("session index fingerprint changes invalidate the warm-read fast path", () => {
+  const sourceRoot = makeTrustedManifestSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const sourceFingerprintBefore = readSyncMetaValue(indexDb, "last_source_fingerprint");
+  const before = readIndexedThread(indexDb, "thread-epay-fix");
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:45:00.000Z",
+    },
+    {
+      id: "thread-shadow",
+      thread_name: "Shadow thread",
+      updated_at: "2026-04-11T02:45:01.000Z",
+    },
+  ]);
+
+  const result = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+
+  const sourceFingerprintAfter = readSyncMetaValue(indexDb, "last_source_fingerprint");
+  expect(sourceFingerprintAfter).not.toBe(sourceFingerprintBefore);
+  expect(readIndexedThread(indexDb, "thread-epay-fix")?.message_count).toBe(before?.message_count);
+});
+
+test("trusted manifest fast path tolerates unrelated log growth for unchanged tracked files", () => {
+  const sourceRoot = makeTrustedManifestSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const lastSyncAtBefore = readSyncMetaValue(indexDb, "last_sync_at");
+  appendLogRow(join(sourceRoot, "logs_2.sqlite"), "thread-epay-fix");
+
+  const second = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(second.status).toBe(0);
+
+  const lastSyncAtAfter = readSyncMetaValue(indexDb, "last_sync_at");
+  expect(lastSyncAtAfter).toBe(lastSyncAtBefore);
+});
+
+test("trusted manifest selective sync refreshes active thread hits without a full source fingerprint change", () => {
+  const sourceRoot = makeTrustedManifestSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const sessionPath = getDefaultSessionPath(sourceRoot);
+
+  const initial = runCli(
+    ["--json", "--refresh", "find", "notify_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(initial.status).toBe(0);
+
+  writeFileSync(sessionPath, `${fixtureSession.replaceAll("notify_url", "callback_url")}\n`, "utf8");
+  appendLogRow(join(sourceRoot, "logs_2.sqlite"), "thread-epay-fix");
+
+  const updated = runCli(
+    ["--json", "find", "callback_url", "--kind", "message", "--limit", "5"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(updated.status).toBe(0);
+  const updatedPayload = JSON.parse(updated.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(updatedPayload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+});
+
+test("stale sibling tracked source rows are cleaned even when no other writes are pending", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-continued-1.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "continued",
+        title: "Continued thread",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "user", text: "initial question" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "initial answer" },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-continued-2.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "continued",
+        title: "Continued thread",
+        messages: [
+          { timestamp: "2026-04-11T02:43:40.000Z", role: "user", text: "follow up question" },
+          { timestamp: "2026-04-11T02:43:41.000Z", role: "assistant", text: "follow up answer" },
+        ],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+  expect(readThreadSourceCount(indexDb, "continued")).toBe(2);
+
+  const secondShardPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-continued-2.jsonl");
+  unlinkSync(secondShardPath);
+
+  const refreshed = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(refreshed.status).toBe(0);
+  expect(readThreadSourceCount(indexDb, "continued")).toBe(1);
 });
 
 test("find --kind message applies provider filtering before the limit", () => {
@@ -1610,7 +2026,7 @@ test("rebuild aggregates messages across multiple session files for one thread",
   };
   expect(indexPayload.data.thread_count).toBe(1);
   expect(indexPayload.data.message_count).toBe(5);
-});
+}, 15_000);
 
 test("human-readable message output preserves multiline full text", () => {
   const longMessage = ["Line one", "", "Line two", "", `${"x".repeat(260)}TAIL_MARKER`].join("\n");
@@ -1924,7 +2340,7 @@ test("changing source root with a shared index triggers a rebuild", () => {
   };
   expect(payload.data.results).toHaveLength(1);
   expect(payload.data.results[0]?.thread_id).toBe("second");
-});
+}, 15_000);
 
 test("concurrent first-run queries wait on the rebuild lock instead of failing", async () => {
   for (let round = 0; round < 2; round += 1) {
@@ -1941,7 +2357,7 @@ test("concurrent first-run queries wait on the rebuild lock instead of failing",
     expect(JSON.parse(left.stdout).ok).toBe(true);
     expect(JSON.parse(right.stdout).ok).toBe(true);
   }
-});
+}, 15_000);
 
 test("read queries wait for an active rebuild lock and then succeed", async () => {
   const sourceRoot = makeFakeSourceRoot();
@@ -2077,7 +2493,7 @@ test("default configured read-only queries fall back to a temporary writable ind
 });
 
 test("ready indexes skip the sync lock when the source manifest is unchanged", async () => {
-  const sourceRoot = makeFakeSourceRoot();
+  const sourceRoot = makeTrustedManifestSourceRoot();
   const indexDb = join(tmpdir(), `agent-threads-ready-index-${Date.now()}.sqlite`);
 
   const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);

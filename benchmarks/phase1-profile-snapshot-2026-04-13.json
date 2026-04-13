@@ -1,0 +1,66 @@
+{
+  "capturedAt": "2026-04-13T10:34:00.292Z",
+  "sourceRoot": "/tmp/ath-codex-snapshot-1776076381",
+  "indexDb": "/tmp/ath-phase1-snapshot-profile.sqlite",
+  "sourceFingerprintBefore": "{\"version\":1,\"stateDbMtimeMs\":1776075845000,\"sessionIndexSizeBytes\":21024,\"sessionIndexMtimeMs\":1776052190000,\"sessionIndexHash\":\"2126678333\",\"archivedSessionsDirMtimeMs\":1775982664000}",
+  "sourceFingerprintAfter": "{\"version\":1,\"stateDbMtimeMs\":1776075845000,\"sessionIndexSizeBytes\":21024,\"sessionIndexMtimeMs\":1776052190000,\"sessionIndexHash\":\"2126678333\",\"archivedSessionsDirMtimeMs\":1775982664000}",
+  "samples": [
+    {
+      "name": "rebuildIndexUnlocked",
+      "elapsedMs": 30854.97,
+      "details": {
+        "builtAt": "2026-04-13T10:33:38.463Z",
+        "threadCount": 1001,
+        "messageCount": 42673,
+        "activeSessionFileCount": 1001,
+        "archivedSessionFileCount": 0
+      }
+    },
+    {
+      "name": "canSkipIncrementalSync",
+      "elapsedMs": 90.69,
+      "details": {
+        "canSkip": true
+      }
+    },
+    {
+      "name": "ensureIndex",
+      "elapsedMs": 17.49
+    },
+    {
+      "name": "getThreadStats",
+      "elapsedMs": 4.89,
+      "details": {
+        "thread_count": 1001,
+        "message_count": 42673
+      }
+    },
+    {
+      "name": "searchMessages_notify_url",
+      "elapsedMs": 34.0,
+      "details": {
+        "resultCount": 20
+      }
+    },
+    {
+      "name": "searchMessages_payment",
+      "elapsedMs": 16.26,
+      "details": {
+        "resultCount": 20
+      }
+    }
+  ],
+  "rawInspectQueries": [
+    { "name": "inspect_query_messages_table", "elapsedMs": 0.23 },
+    { "name": "inspect_query_totals", "elapsedMs": 2.79 },
+    { "name": "inspect_query_message_count", "elapsedMs": 0.3 },
+    { "name": "inspect_query_providers", "elapsedMs": 0.08 },
+    { "name": "inspect_query_top_cwds", "elapsedMs": 0.23 },
+    { "name": "inspect_query_meta", "elapsedMs": 0.04 }
+  ],
+  "artifacts": {
+    "indexDbBytes": 239890432,
+    "walBytes": 241432032,
+    "shmBytes": 491520
+  }
+}

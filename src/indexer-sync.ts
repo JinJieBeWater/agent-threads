@@ -5,27 +5,44 @@ import { readFileStats, readFileString, readModifiedTime } from "./infra/fs.ts";
 import { all, get, withDatabase } from "./infra/sqlite.ts";
 import {
   buildThreadRecordFromSessions,
-  chooseCanonicalSnapshot,
   deleteThreadData,
+  deleteTrackedSourcePath,
   deleteThreadSource,
   initializeIndexSchema,
   insertMessages,
+  insertMessagesTableOnly,
   insertThread,
+  insertThreads,
   isIndexUsable,
   readIndexedThreads,
+  readTrackedSourceFiles,
   readTrackedThreadSources,
   refreshIndexMeta,
+  refreshIndexMetaFromTrackedSources,
+  rebuildMessagesFtsFromMessages,
   refreshSyncMeta,
   refreshThreadMetadataIfNeeded,
   resetIndex,
+  touchThreadSourcesMetadata,
   trackedSourceNeedsRebuild,
   type SourceFileSnapshot,
   type IndexedThreadRow,
+  type TrackedSourceFile,
   type TrackedThreadSource,
   upsertThreadSource,
+  upsertThreadSources,
   markThreadSourceMissing,
 } from "./indexer-store.ts";
-import { inferThreadIdFromSessionFile, parseJsonlSession, readStateThreads, walkJsonlFiles } from "./source/codex.ts";
+import {
+  hasTrustedHostManifest,
+  readActiveThreadIdsSince,
+  readLogsHighWater,
+  inferThreadIdFromSessionFile,
+  parseJsonlSession,
+  readSourceFingerprint,
+  readStateThreads,
+  walkJsonlFiles,
+} from "./source/codex.ts";
 import type { MessageRecord, ParsedSessionFile, ResolvedPaths, ThreadRecord } from "./types.ts";
 
 export interface RebuildIndexStats {
@@ -53,13 +70,87 @@ export function scanSourceFiles(paths: ResolvedPaths): Effect.Effect<SourceFileS
             path: entry.path,
             archived: entry.archived,
             sizeBytes: stats.sizeBytes,
-            mtimeMs: stats.mtimeMs ?? 0,
+            mtimeMs: Math.floor(stats.mtimeMs ?? 0),
           })),
         ),
       { concurrency: "unbounded" },
     );
 
     return snapshots.sort((left, right) => left.path.localeCompare(right.path));
+  });
+}
+
+function parentDirectory(path: string): string | null {
+  const slashIndex = path.lastIndexOf("/");
+  if (slashIndex <= 0) {
+    return null;
+  }
+  return path.slice(0, slashIndex);
+}
+
+function collectSourceDirectories(paths: ResolvedPaths, snapshots: SourceFileSnapshot[]): string[] {
+  const directories = new Set<string>([paths.sessionsDir, paths.archivedSessionsDir]);
+
+  for (const snapshot of snapshots) {
+    const root = snapshot.archived === 1 ? paths.archivedSessionsDir : paths.sessionsDir;
+    let current = parentDirectory(snapshot.path);
+    while (current?.startsWith(root)) {
+      directories.add(current);
+      if (current === root) {
+        break;
+      }
+      current = parentDirectory(current);
+    }
+  }
+
+  return [...directories].sort((left, right) => left.localeCompare(right));
+}
+
+function buildSourceDirectoryManifest(
+  paths: ResolvedPaths,
+  snapshots: SourceFileSnapshot[],
+): Effect.Effect<string, CliFailure> {
+  return Effect.gen(function* () {
+    const directories = collectSourceDirectories(paths, snapshots);
+    const entries = yield* Effect.forEach(
+      directories,
+      (path) =>
+        readModifiedTime(path).pipe(
+          Effect.map((mtimeMs) => ({
+            path,
+            mtimeMs: Math.floor(mtimeMs ?? 0),
+          })),
+        ),
+      { concurrency: "unbounded" },
+    );
+
+    return JSON.stringify(entries);
+  });
+}
+
+function hasMatchingSourceDirectoryManifest(
+  storedManifest: string | undefined,
+): Effect.Effect<boolean, CliFailure> {
+  return Effect.gen(function* () {
+    if (!storedManifest) {
+      return false;
+    }
+
+    let entries: Array<{ path: string; mtimeMs: number }>;
+    try {
+      entries = JSON.parse(storedManifest) as Array<{ path: string; mtimeMs: number }>;
+    } catch {
+      return false;
+    }
+
+    for (const entry of entries) {
+      const currentMtime = yield* readModifiedTime(entry.path).pipe(Effect.catchAll(() => Effect.succeed(null)));
+      if (Math.floor(currentMtime ?? 0) !== Number(entry.mtimeMs ?? 0)) {
+        return false;
+      }
+    }
+
+    return true;
   });
 }
 
@@ -105,6 +196,7 @@ interface IncrementalSyncPlan {
   plannedMetadataRefreshes: Set<string>;
   plannedMissingMarks: Set<string>;
   plannedDeletes: Set<string>;
+  plannedTrackedPathDeletes: Set<string>;
   blockedRebuildThreads: Set<string>;
 }
 
@@ -161,6 +253,7 @@ function createIncrementalSyncPlan(): IncrementalSyncPlan {
     plannedMetadataRefreshes: new Set<string>(),
     plannedMissingMarks: new Set<string>(),
     plannedDeletes: new Set<string>(),
+    plannedTrackedPathDeletes: new Set<string>(),
     blockedRebuildThreads: new Set<string>(),
   };
 }
@@ -170,6 +263,382 @@ function finalizeIncrementalSyncPlan(plan: IncrementalSyncPlan): IncrementalSync
     plan.plannedRebuilds.delete(threadId);
   }
   return plan;
+}
+
+function syncThreadSourcesForParsedSessions(
+  db: Parameters<Parameters<typeof withDatabase>[1]>[0],
+  threadId: string,
+  parsedSessions: ParsedSessionFile[],
+  snapshotByPath: Map<string, SourceFileSnapshot>,
+  lastStateUpdatedAt: number,
+  seenAt: string,
+): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    yield* deleteThreadSource(db, threadId);
+    for (const parsed of parsedSessions) {
+      const sourceFile = parsed.meta.sourceFile;
+      if (!sourceFile) {
+        continue;
+      }
+      const snapshot = snapshotByPath.get(sourceFile);
+      if (!snapshot) {
+        continue;
+      }
+      yield* upsertThreadSource(db, threadId, snapshot, lastStateUpdatedAt, seenAt);
+    }
+  });
+}
+
+function groupTrackedSourceFilesByThread(trackedByPath: Map<string, TrackedSourceFile>): Map<string, TrackedSourceFile[]> {
+  const grouped = new Map<string, TrackedSourceFile[]>();
+  for (const tracked of trackedByPath.values()) {
+    const rows = grouped.get(tracked.threadId) ?? [];
+    rows.push(tracked);
+    grouped.set(tracked.threadId, rows);
+  }
+  return grouped;
+}
+
+function chooseRepresentativeTrackedSource(
+  trackedFiles: TrackedSourceFile[] | undefined,
+  preferredPaths: Array<string | null | undefined> = [],
+): TrackedThreadSource | undefined {
+  if (!trackedFiles || trackedFiles.length === 0) {
+    return undefined;
+  }
+
+  for (const preferredPath of preferredPaths) {
+    if (!preferredPath) {
+      continue;
+    }
+    const matched = trackedFiles.find((tracked) => tracked.currentPath === preferredPath);
+    if (matched) {
+      return matched;
+    }
+  }
+
+  const sorted = [...trackedFiles].sort((left, right) => {
+    const missingDelta = Number(left.missingSince !== null) - Number(right.missingSince !== null);
+    if (missingDelta !== 0) {
+      return missingDelta;
+    }
+    const archivedDelta = left.archived - right.archived;
+    if (archivedDelta !== 0) {
+      return archivedDelta;
+    }
+    return right.mtimeMs - left.mtimeMs;
+  });
+  return sorted[0];
+}
+
+function validateTrackedFiles(
+  trackedFiles: TrackedSourceFile[],
+): Effect.Effect<boolean, CliFailure> {
+  return Effect.gen(function* () {
+    for (const tracked of trackedFiles) {
+      const stats = yield* readFileStats(tracked.currentPath).pipe(Effect.catchAll(() => Effect.succeed(null)));
+      if (!stats) {
+        return false;
+      }
+
+      if (
+        trackedSourceNeedsRebuild(tracked, {
+          path: tracked.currentPath,
+          archived: tracked.archived,
+          sizeBytes: stats.sizeBytes,
+          mtimeMs: Math.floor(stats.mtimeMs ?? 0),
+        })
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+}
+
+function buildSnapshotFromPath(
+  paths: ResolvedPaths,
+  path: string,
+): Effect.Effect<SourceFileSnapshot | null, CliFailure> {
+  return readFileStats(path).pipe(
+    Effect.map((stats) => ({
+      path,
+      archived: path.startsWith(paths.archivedSessionsDir) ? (1 as const) : (0 as const),
+      sizeBytes: stats.sizeBytes,
+      mtimeMs: Math.floor(stats.mtimeMs ?? 0),
+    })),
+    Effect.catchAll(() => Effect.succeed(null)),
+  );
+}
+
+function buildTrustedThreadSnapshots(
+  paths: ResolvedPaths,
+  trackedFiles: TrackedSourceFile[] | undefined,
+  stateThread: ThreadRecord | undefined,
+): Effect.Effect<SourceFileSnapshot[] | null, CliFailure> {
+  return Effect.gen(function* () {
+    const candidatePaths = new Set<string>();
+    for (const tracked of trackedFiles ?? []) {
+      candidatePaths.add(tracked.currentPath);
+    }
+    if (stateThread?.rolloutPath) {
+      candidatePaths.add(stateThread.rolloutPath);
+    }
+    if (candidatePaths.size === 0) {
+      return null;
+    }
+
+    const snapshots: SourceFileSnapshot[] = [];
+    for (const path of candidatePaths) {
+      const snapshot = yield* buildSnapshotFromPath(paths, path);
+      if (!snapshot) {
+        return null;
+      }
+      snapshots.push(snapshot);
+    }
+
+    return snapshots.sort((left, right) => left.path.localeCompare(right.path));
+  });
+}
+
+function hasTrackedFileChanges(
+  trackedFiles: TrackedSourceFile[] | undefined,
+  snapshots: SourceFileSnapshot[],
+): boolean {
+  if (!trackedFiles || trackedFiles.length !== snapshots.length) {
+    return true;
+  }
+
+  const trackedByPath = new Map(trackedFiles.map((tracked) => [tracked.currentPath, tracked]));
+  return snapshots.some((snapshot) => trackedSourceNeedsRebuild(trackedByPath.get(snapshot.path), snapshot));
+}
+
+export function synchronizeTrustedActiveThreadsUnlocked(paths: ResolvedPaths): Effect.Effect<boolean, CliFailure> {
+  return Effect.gen(function* () {
+    const trustedManifest = yield* hasTrustedHostManifest(paths);
+    if (!trustedManifest) {
+      return false;
+    }
+
+    const sourceFingerprint = yield* readSourceFingerprint(paths);
+    const logsHighWater = yield* readLogsHighWater(paths);
+    const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
+    const nowIso = new Date().toISOString();
+    const stateThreads = yield* readStateThreads(paths.stateDb);
+
+    if (sourceFingerprint === null || logsHighWater === null) {
+      return false;
+    }
+
+    return yield* withDatabase(paths.indexDb, (db) =>
+      Effect.gen(function* () {
+        const syncMeta = yield* all<{ key: string; value: string }>(db, `SELECT key, value FROM sync_meta`).pipe(
+          Effect.map((rows) => Object.fromEntries(rows.map((row) => [row.key, row.value]))),
+        );
+        if (syncMeta.last_source_fingerprint !== sourceFingerprint) {
+          return false;
+        }
+        if (Number(syncMeta.last_state_db_mtime_ms ?? 0) !== Number(stateDbMtime ?? 0)) {
+          return false;
+        }
+
+        const previousLogsHighWater = Number(syncMeta.last_logs_high_water ?? 0);
+        const currentLogsHighWater = Number(logsHighWater ?? 0);
+        if (!Number.isFinite(currentLogsHighWater)) {
+          return false;
+        }
+        if (currentLogsHighWater <= previousLogsHighWater) {
+          return true;
+        }
+
+        const activeThreadIds = yield* readActiveThreadIdsSince(paths, previousLogsHighWater);
+        if (activeThreadIds.length === 0) {
+          yield* refreshSyncMeta(
+            db,
+            stateDbMtime,
+            sourceFingerprint,
+            syncMeta.last_source_directory_manifest ?? "",
+            currentLogsHighWater,
+            nowIso,
+          );
+          return true;
+        }
+
+        const trackedSourceFiles = yield* readTrackedSourceFiles(db);
+        const trackedSourceFilesByThread = groupTrackedSourceFilesByThread(trackedSourceFiles);
+        const trackedByThread = yield* readTrackedThreadSources(db);
+        const indexedThreads = yield* readIndexedThreads(db);
+        const selectivePlan = createIncrementalSyncPlan();
+        const snapshotByPath = new Map<string, SourceFileSnapshot>();
+        const parsedSessionsByThread = new Map<string, ParsedSessionFile[]>();
+        let canAdvanceLogsHighWater = true;
+
+        for (const threadId of activeThreadIds) {
+          const trackedFiles = trackedSourceFilesByThread.get(threadId);
+          const stateThread = stateThreads.get(threadId);
+          const snapshots = yield* buildTrustedThreadSnapshots(paths, trackedFiles, stateThread);
+          if (!snapshots) {
+            return false;
+          }
+
+          for (const snapshot of snapshots) {
+            snapshotByPath.set(snapshot.path, snapshot);
+          }
+
+          let parsedSessions: ParsedSessionFile[] = [];
+          for (const snapshot of snapshots) {
+            const stable = yield* isSnapshotStableForRebuild(snapshot);
+            if (!stable) {
+              canAdvanceLogsHighWater = false;
+              parsedSessions = [];
+              break;
+            }
+            const parsed = yield* parseJsonlSession(snapshot.path, snapshot.archived === 1);
+            if (parsed?.threadId === threadId) {
+              parsedSessions.push(parsed);
+            }
+          }
+
+          if (parsedSessions.length === 0 && canAdvanceLogsHighWater === false) {
+            continue;
+          }
+          if (parsedSessions.length === 0) {
+            return false;
+          }
+
+          parsedSessions = parsedSessions.sort((left, right) =>
+            String(left.meta.sourceFile ?? "").localeCompare(String(right.meta.sourceFile ?? "")),
+          );
+          parsedSessionsByThread.set(threadId, parsedSessions);
+
+          const tracked = trackedByThread.get(threadId);
+          const needsRebuild = hasTrackedFileChanges(trackedFiles, snapshots);
+          const needsMetadataRefresh =
+            !!tracked && !!stateThread && tracked.lastStateUpdatedAt !== Number(stateThread.updatedAt ?? 0);
+
+          if (!tracked || needsRebuild) {
+            const firstSnapshot = snapshots[0];
+            if (!firstSnapshot) {
+              return false;
+            }
+            selectivePlan.plannedRebuilds.set(threadId, firstSnapshot);
+            continue;
+          }
+
+          if (needsMetadataRefresh) {
+            selectivePlan.plannedMetadataRefreshes.add(threadId);
+          }
+        }
+
+        if (
+          selectivePlan.plannedRebuilds.size === 0 &&
+          selectivePlan.plannedMetadataRefreshes.size === 0
+        ) {
+          if (canAdvanceLogsHighWater) {
+            yield* refreshSyncMeta(
+              db,
+              stateDbMtime,
+              sourceFingerprint,
+              syncMeta.last_source_directory_manifest ?? "",
+              currentLogsHighWater,
+              nowIso,
+            );
+          }
+          return true;
+        }
+
+        yield* db.withTransaction(
+          Effect.gen(function* () {
+            for (const [threadId] of selectivePlan.plannedRebuilds) {
+              const parsedSessions = parsedSessionsByThread.get(threadId);
+              if (!parsedSessions || parsedSessions.length === 0) {
+                continue;
+              }
+              const { thread, canonicalMessages } = buildThreadRecordFromSessions(
+                stateThreads.get(threadId),
+                parsedSessions,
+                snapshotByPath,
+              );
+              yield* deleteThreadData(db, threadId);
+              yield* insertThread(db, thread);
+              yield* insertMessages(db, canonicalMessages);
+              yield* syncThreadSourcesForParsedSessions(
+                db,
+                threadId,
+                parsedSessions,
+                snapshotByPath,
+                Number(stateThreads.get(threadId)?.updatedAt ?? 0),
+                nowIso,
+              );
+            }
+
+            for (const threadId of selectivePlan.plannedMetadataRefreshes) {
+              const indexed = indexedThreads.get(threadId);
+              const stateThread = stateThreads.get(threadId);
+              const tracked = chooseRepresentativeTrackedSource(
+                trackedSourceFilesByThread.get(threadId),
+                [typeof indexed?.source_file === "string" ? indexed.source_file : null, stateThread?.rolloutPath],
+              );
+              if (!tracked || !indexed || !stateThread) {
+                continue;
+              }
+              yield* refreshThreadMetadataIfNeeded(db, indexed, stateThread, tracked);
+              yield* touchThreadSourcesMetadata(db, threadId, Number(stateThread.updatedAt ?? 0), nowIso);
+            }
+
+            yield* refreshSyncMeta(
+              db,
+              stateDbMtime,
+              sourceFingerprint,
+              syncMeta.last_source_directory_manifest ?? "",
+              canAdvanceLogsHighWater ? currentLogsHighWater : previousLogsHighWater,
+              nowIso,
+            );
+            yield* refreshIndexMetaFromTrackedSources(db, paths, nowIso);
+          }),
+        ).pipe(
+          Effect.mapError((cause) => new CliFailure({ code: "sqlite-error", message: String(cause) })),
+        );
+
+        return true;
+      }),
+    );
+  });
+}
+
+function planStaleTrackedPaths(
+  trackedByPath: Map<string, TrackedSourceFile>,
+  currentByPath: Map<string, SourceFileSnapshot>,
+  groupedTrackedByThread: Map<string, TrackedSourceFile[]>,
+  stateThreads: Map<string, ThreadRecord>,
+  plan: IncrementalSyncPlan,
+): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    for (const tracked of trackedByPath.values()) {
+      if (currentByPath.has(tracked.currentPath)) {
+        continue;
+      }
+      const siblings = groupedTrackedByThread.get(tracked.threadId) ?? [];
+      const stillPresentSibling = siblings.some(
+        (sibling) => sibling.currentPath !== tracked.currentPath && currentByPath.has(sibling.currentPath),
+      );
+      if (stillPresentSibling) {
+        plan.plannedTrackedPathDeletes.add(tracked.currentPath);
+        continue;
+      }
+
+      const stateThread = stateThreads.get(tracked.threadId);
+      if (stateThread) {
+        continue;
+      }
+      if (tracked.missingSince) {
+        plan.plannedDeletes.add(tracked.threadId);
+      } else {
+        plan.plannedMissingMarks.add(tracked.threadId);
+      }
+    }
+  });
 }
 
 function planStateThreads(
@@ -183,7 +652,7 @@ function planStateThreads(
   return Effect.gen(function* () {
     for (const [threadId, stateThread] of stateThreads) {
       const tracked = trackedByThread.get(threadId);
-      const expectedPath = stateThread.rolloutPath ?? tracked?.currentPath ?? null;
+      const expectedPath = tracked?.currentPath ?? stateThread.rolloutPath ?? null;
       if (!expectedPath) {
         continue;
       }
@@ -283,7 +752,7 @@ function planUncoveredSnapshots(
       }
       const tracked = trackedByThread.get(discoveredThreadId);
       const stateThread = stateThreads.get(discoveredThreadId);
-      const canonicalPath = stateThread?.rolloutPath ?? tracked?.currentPath ?? null;
+      const canonicalPath = tracked?.currentPath ?? stateThread?.rolloutPath ?? null;
       plan.plannedMissingMarks.delete(discoveredThreadId);
       plan.plannedDeletes.delete(discoveredThreadId);
 
@@ -311,22 +780,30 @@ function applyIncrementalSyncPlan(
     reader: SnapshotStateReader;
     stateThreads: Map<string, ThreadRecord>;
     trackedByThread: Map<string, TrackedThreadSource>;
+    trackedSourceFilesByThread: Map<string, TrackedSourceFile[]>;
     indexedThreads: Map<string, IndexedThreadRow>;
     currentByPath: Map<string, SourceFileSnapshot>;
     currentSnapshots: SourceFileSnapshot[];
     paths: ResolvedPaths;
     stateDbMtime: number | null;
+    sourceFingerprint: string | null;
+    sourceDirectoryManifest: string;
+    logsHighWater: number | null;
     nowIso: string;
   },
 ): Effect.Effect<void, CliFailure> {
   return Effect.gen(function* () {
-    const { plan, reader, stateThreads, trackedByThread, indexedThreads, currentByPath, currentSnapshots, paths, stateDbMtime, nowIso } =
+    const { plan, reader, stateThreads, trackedByThread, trackedSourceFilesByThread, indexedThreads, currentByPath, currentSnapshots, paths, stateDbMtime, sourceFingerprint, sourceDirectoryManifest, logsHighWater, nowIso } =
       input;
     const touchedThreadData = plan.plannedRebuilds.size > 0 || plan.plannedDeletes.size > 0;
     let touchedThreadMetadata = false;
 
     yield* db.withTransaction(
       Effect.gen(function* () {
+        for (const path of plan.plannedTrackedPathDeletes) {
+          yield* deleteTrackedSourcePath(db, path);
+        }
+
         for (const threadId of plan.plannedDeletes) {
           yield* deleteThreadData(db, threadId);
           yield* deleteThreadSource(db, threadId);
@@ -344,7 +821,7 @@ function applyIncrementalSyncPlan(
           }
 
           const parsedSessions = yield* reader.collectParsedSessionsForThread(snapshotState.parsed.threadId);
-          const { thread, canonicalMessages, canonicalSource } = buildThreadRecordFromSessions(
+          const { thread, canonicalMessages } = buildThreadRecordFromSessions(
             stateThreads.get(snapshotState.parsed.threadId),
             parsedSessions,
             currentByPath,
@@ -352,36 +829,31 @@ function applyIncrementalSyncPlan(
           yield* deleteThreadData(db, snapshotState.parsed.threadId);
           yield* insertThread(db, thread);
           yield* insertMessages(db, canonicalMessages);
-          yield* upsertThreadSource(
+          yield* syncThreadSourcesForParsedSessions(
             db,
             snapshotState.parsed.threadId,
-            canonicalSource ?? snapshot,
+            parsedSessions,
+            currentByPath,
             Number(stateThreads.get(snapshotState.parsed.threadId)?.updatedAt ?? 0),
             nowIso,
           );
         }
 
         for (const threadId of plan.plannedMetadataRefreshes) {
-          const tracked = trackedByThread.get(threadId);
           const indexed = indexedThreads.get(threadId);
           const stateThread = stateThreads.get(threadId);
+          const tracked = chooseRepresentativeTrackedSource(
+            trackedSourceFilesByThread
+              .get(threadId)
+              ?.filter((sourceFile) => !plan.plannedTrackedPathDeletes.has(sourceFile.currentPath)),
+            [typeof indexed?.source_file === "string" ? indexed.source_file : null, stateThread?.rolloutPath],
+          );
           if (!tracked || !indexed || !stateThread) {
             continue;
           }
           const changed = yield* refreshThreadMetadataIfNeeded(db, indexed, stateThread, tracked);
           touchedThreadMetadata = touchedThreadMetadata || changed;
-          yield* upsertThreadSource(
-            db,
-            threadId,
-            {
-              path: tracked.currentPath,
-              archived: tracked.archived,
-              sizeBytes: tracked.sizeBytes,
-              mtimeMs: tracked.mtimeMs,
-            },
-            Number(stateThread.updatedAt ?? 0),
-            nowIso,
-          );
+          yield* touchThreadSourcesMetadata(db, threadId, Number(stateThread.updatedAt ?? 0), nowIso);
         }
 
         for (const threadId of plan.plannedMissingMarks) {
@@ -391,7 +863,7 @@ function applyIncrementalSyncPlan(
           }
         }
 
-        yield* refreshSyncMeta(db, stateDbMtime, nowIso);
+        yield* refreshSyncMeta(db, stateDbMtime, sourceFingerprint, sourceDirectoryManifest, logsHighWater, nowIso);
         if (touchedThreadData || touchedThreadMetadata) {
           yield* refreshIndexMeta(db, paths, currentSnapshots, nowIso);
         }
@@ -407,7 +879,10 @@ export function synchronizeIncrementalUnlocked(paths: ResolvedPaths): Effect.Eff
     const nowIso = new Date().toISOString();
     const stateThreads = yield* readStateThreads(paths.stateDb);
     const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
+    const sourceFingerprint = yield* readSourceFingerprint(paths);
+    const logsHighWater = yield* readLogsHighWater(paths);
     const currentSnapshots = yield* scanSourceFiles(paths);
+    const sourceDirectoryManifest = yield* buildSourceDirectoryManifest(paths, currentSnapshots);
     const currentByPath = new Map(currentSnapshots.map((snapshot) => [snapshot.path, snapshot]));
     const { readSnapshotState, collectParsedSessionsForThread } = createParsedSnapshotReader(currentSnapshots);
 
@@ -415,6 +890,8 @@ export function synchronizeIncrementalUnlocked(paths: ResolvedPaths): Effect.Eff
       Effect.gen(function* () {
         yield* initializeIndexSchema(db);
 
+        const trackedSourceFiles = yield* readTrackedSourceFiles(db);
+        const trackedSourceFilesByThread = groupTrackedSourceFilesByThread(trackedSourceFiles);
         const trackedByThread = yield* readTrackedThreadSources(db);
         const syncMeta = yield* all<{ key: string; value: string }>(db, `SELECT key, value FROM sync_meta`).pipe(
           Effect.map((rows) => Object.fromEntries(rows.map((row) => [row.key, row.value]))),
@@ -438,15 +915,28 @@ export function synchronizeIncrementalUnlocked(paths: ResolvedPaths): Effect.Eff
           { readSnapshotState, collectParsedSessionsForThread },
           plan,
         );
+        yield* planStaleTrackedPaths(
+          trackedSourceFiles,
+          currentByPath,
+          trackedSourceFilesByThread,
+          stateThreads,
+          plan,
+        );
         finalizeIncrementalSyncPlan(plan);
 
         const shouldRefreshMetadata = Number(syncMeta.last_state_db_mtime_ms ?? 0) !== Number(stateDbMtime ?? 0);
+        const shouldRefreshFingerprint = (syncMeta.last_source_fingerprint ?? "") !== (sourceFingerprint ?? "");
+        const shouldRefreshDirectoryManifest =
+          (syncMeta.last_source_directory_manifest ?? "") !== sourceDirectoryManifest;
         const shouldWrite =
           plan.plannedRebuilds.size > 0 ||
           plan.plannedMetadataRefreshes.size > 0 ||
           plan.plannedMissingMarks.size > 0 ||
           plan.plannedDeletes.size > 0 ||
-          shouldRefreshMetadata;
+          plan.plannedTrackedPathDeletes.size > 0 ||
+          shouldRefreshMetadata ||
+          shouldRefreshFingerprint ||
+          shouldRefreshDirectoryManifest;
 
         if (!shouldWrite) {
           return;
@@ -457,11 +947,15 @@ export function synchronizeIncrementalUnlocked(paths: ResolvedPaths): Effect.Eff
           reader: { readSnapshotState, collectParsedSessionsForThread },
           stateThreads,
           trackedByThread,
+          trackedSourceFilesByThread,
           indexedThreads,
           currentByPath,
           currentSnapshots,
           paths,
           stateDbMtime,
+          sourceFingerprint,
+          sourceDirectoryManifest,
+          logsHighWater,
           nowIso,
         });
       }),
@@ -476,34 +970,81 @@ export function canSkipIncrementalSync(paths: ResolvedPaths): Effect.Effect<bool
       return false;
     }
 
-    const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
-    const currentSnapshots = yield* scanSourceFiles(paths);
+    const sourceFingerprint = yield* readSourceFingerprint(paths);
+    const logsHighWater = yield* readLogsHighWater(paths);
 
     return yield* withDatabase(paths.indexDb, (db) =>
       Effect.gen(function* () {
-        const trackedByThread = yield* readTrackedThreadSources(db);
+        const trackedByPath = yield* readTrackedSourceFiles(db);
+        const trackedByThread = groupTrackedSourceFilesByThread(trackedByPath);
         const syncMeta = yield* all<{ key: string; value: string }>(db, `SELECT key, value FROM sync_meta`).pipe(
           Effect.map((rows) => Object.fromEntries(rows.map((row) => [row.key, row.value]))),
         );
+
+        if (Array.from(trackedByPath.values()).some((tracked) => tracked.missingSince !== null)) {
+          return false;
+        }
+
+        if (sourceFingerprint !== null) {
+          if (syncMeta.last_source_fingerprint !== sourceFingerprint) {
+            return false;
+          }
+
+          const trustedManifest = yield* hasTrustedHostManifest(paths);
+          if (!trustedManifest) {
+            return false;
+          }
+
+          const previousLogsHighWater = Number(syncMeta.last_logs_high_water ?? 0);
+          const currentLogsHighWater = Number(logsHighWater ?? 0);
+          if (!Number.isFinite(currentLogsHighWater)) {
+            return false;
+          }
+
+          if (currentLogsHighWater <= previousLogsHighWater) {
+            return true;
+          }
+
+          const activeThreadIds = yield* readActiveThreadIdsSince(paths, previousLogsHighWater);
+          for (const threadId of activeThreadIds) {
+            const trackedFiles = trackedByThread.get(threadId);
+            if (!trackedFiles || trackedFiles.length === 0) {
+              return false;
+            }
+            if (!(yield* validateTrackedFiles(trackedFiles))) {
+              return false;
+            }
+          }
+
+          return true;
+        }
+
+        const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
         if (Number(syncMeta.last_state_db_mtime_ms ?? 0) !== Number(stateDbMtime ?? 0)) {
           return false;
         }
 
-        const trackedByPath = new Map(
-          Array.from(trackedByThread.values())
-            .filter((tracked) => tracked.missingSince === null)
-            .map((tracked) => [tracked.currentPath, tracked]),
+        const liveTrackedByPath = new Map(
+          Array.from(trackedByPath.entries()).filter(([, tracked]) => tracked.missingSince === null),
         );
-        if (trackedByPath.size !== trackedByThread.size) {
-          return false;
-        }
-        if (trackedByPath.size !== currentSnapshots.length) {
+        if (!(yield* hasMatchingSourceDirectoryManifest(syncMeta.last_source_directory_manifest))) {
           return false;
         }
 
-        for (const snapshot of currentSnapshots) {
-          const tracked = trackedByPath.get(snapshot.path);
-          if (!tracked || trackedSourceNeedsRebuild(tracked, snapshot)) {
+        for (const [path, tracked] of liveTrackedByPath) {
+          const stats = yield* readFileStats(path).pipe(Effect.catchAll(() => Effect.succeed(null)));
+          if (!stats) {
+            return false;
+          }
+
+          if (
+            trackedSourceNeedsRebuild(tracked, {
+              path,
+              archived: tracked.archived,
+              sizeBytes: stats.sizeBytes,
+              mtimeMs: Math.floor(stats.mtimeMs ?? 0),
+            })
+          ) {
             return false;
           }
         }
@@ -518,87 +1059,33 @@ export function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<Rebuil
   return Effect.gen(function* () {
     const threadMap = yield* readStateThreads(paths.stateDb);
     const allSessions = yield* scanSourceFiles(paths);
-    const threadMessages = new Map<string, MessageRecord[]>();
-    const canonicalSources = new Map<string, SourceFileSnapshot>();
+    const snapshotByPath = new Map(allSessions.map((snapshot) => [snapshot.path, snapshot]));
+    const sourceFingerprint = yield* readSourceFingerprint(paths);
+    const logsHighWater = yield* readLogsHighWater(paths);
+    const sourceDirectoryManifest = yield* buildSourceDirectoryManifest(paths, allSessions);
+    const parsedSessionsByThread = new Map<string, ParsedSessionFile[]>();
 
-    for (const entry of allSessions) {
-      const parsed = yield* parseJsonlSession(entry.path, entry.archived === 1);
+    const parsedSessions = yield* Effect.forEach(
+      allSessions,
+      (entry) => parseJsonlSession(entry.path, entry.archived === 1),
+      { concurrency: 32 },
+    );
+
+    for (const parsed of parsedSessions) {
       if (!parsed) {
         continue;
       }
-
-      canonicalSources.set(
-        parsed.threadId,
-        chooseCanonicalSnapshot(canonicalSources.get(parsed.threadId), entry, threadMap.get(parsed.threadId)),
-      );
-
-      const existing = threadMap.get(parsed.threadId) ?? {
-        threadId: parsed.threadId,
-        rolloutPath: null,
-        createdAt: null,
-        updatedAt: null,
-        source: parsed.meta.source ?? null,
-        modelProvider: parsed.meta.modelProvider ?? null,
-        cwd: parsed.meta.cwd ?? null,
-        title: parsed.meta.title ?? null,
-        sandboxPolicy: null,
-        approvalMode: null,
-        tokensUsed: null,
-        archived: parsed.meta.archived ?? 0,
-        archivedAt: null,
-        gitSha: null,
-        gitBranch: null,
-        gitOriginUrl: null,
-        cliVersion: parsed.meta.cliVersion ?? null,
-        firstUserMessage: null,
-        agentNickname: null,
-        agentRole: null,
-        memoryMode: null,
-        model: null,
-        reasoningEffort: null,
-        agentPath: null,
-        sourceFile: parsed.meta.sourceFile ?? null,
-        sourceKind: parsed.meta.archived ? "archived" : "session",
-        fileExists: 1,
-        messageCount: 0,
-        userMessageCount: 0,
-        assistantMessageCount: 0,
-        lastMessageAt: null,
-      } satisfies ThreadRecord;
-
-      existing.sourceFile = parsed.meta.sourceFile ?? existing.sourceFile;
-      existing.sourceKind = parsed.meta.archived ? "archived" : existing.sourceKind;
-      existing.fileExists = 1;
-      existing.archived = parsed.meta.archived ?? existing.archived;
-      existing.cwd = parsed.meta.cwd ?? existing.cwd;
-      existing.modelProvider = parsed.meta.modelProvider ?? existing.modelProvider;
-      existing.source = parsed.meta.source ?? existing.source;
-      existing.cliVersion = parsed.meta.cliVersion ?? existing.cliVersion;
-
-      const collectedMessages = threadMessages.get(parsed.threadId) ?? [];
-      collectedMessages.push(...parsed.messages);
-      threadMessages.set(parsed.threadId, collectedMessages);
-
-      canonicalSources.set(
-        parsed.threadId,
-        chooseCanonicalSnapshot(canonicalSources.get(parsed.threadId), entry, threadMap.get(parsed.threadId)),
-      );
-
-      threadMap.set(parsed.threadId, existing);
+      const grouped = parsedSessionsByThread.get(parsed.threadId) ?? [];
+      grouped.push(parsed);
+      parsedSessionsByThread.set(parsed.threadId, grouped);
     }
 
     const canonicalThreadMessages = new Map<string, MessageRecord[]>();
-    for (const [threadId, messages] of threadMessages) {
+    for (const [threadId, sessions] of parsedSessionsByThread) {
       const { thread, canonicalMessages } = buildThreadRecordFromSessions(
         threadMap.get(threadId),
-        [
-          {
-            threadId,
-            meta: threadMap.get(threadId) ?? {},
-            messages,
-          } as ParsedSessionFile,
-        ],
-        new Map(Array.from(canonicalSources.entries()).map(([_threadId, snapshot]) => [snapshot.path, snapshot])),
+        sessions,
+        snapshotByPath,
       );
       threadMap.set(threadId, thread);
       canonicalThreadMessages.set(threadId, canonicalMessages);
@@ -614,27 +1101,38 @@ export function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<Rebuil
           Effect.gen(function* () {
             yield* resetIndex(db);
 
-            for (const thread of threadMap.values()) {
-              yield* insertThread(db, thread);
-            }
+            yield* insertThreads(db, Array.from(threadMap.values()));
 
             for (const messages of canonicalThreadMessages.values()) {
-              yield* insertMessages(db, messages);
+              yield* insertMessagesTableOnly(db, messages);
             }
+            yield* rebuildMessagesFtsFromMessages(db);
 
-            for (const [threadId, snapshot] of canonicalSources) {
-              yield* upsertThreadSource(
-                db,
-                threadId,
-                snapshot,
-                Number(threadMap.get(threadId)?.updatedAt ?? 0),
-                builtAt,
-              );
-            }
+            const trackedSourceRows = Array.from(parsedSessionsByThread.entries()).flatMap(([threadId, parsedSessions]) =>
+              parsedSessions.flatMap((parsed) => {
+                const sourceFile = parsed.meta.sourceFile;
+                if (!sourceFile) {
+                  return [];
+                }
+                const snapshot = snapshotByPath.get(sourceFile);
+                if (!snapshot) {
+                  return [];
+                }
+                return [
+                  {
+                    threadId,
+                    snapshot,
+                    lastStateUpdatedAt: Number(threadMap.get(threadId)?.updatedAt ?? 0),
+                    seenAt: builtAt,
+                  },
+                ];
+              }),
+            );
+            yield* upsertThreadSources(db, trackedSourceRows);
 
             yield* refreshIndexMeta(db, paths, allSessions, builtAt);
             const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
-            yield* refreshSyncMeta(db, stateDbMtime, builtAt);
+            yield* refreshSyncMeta(db, stateDbMtime, sourceFingerprint, sourceDirectoryManifest, logsHighWater, builtAt);
           }),
         ).pipe(
           Effect.mapError((cause) => new CliFailure({ code: "sqlite-error", message: String(cause) })),

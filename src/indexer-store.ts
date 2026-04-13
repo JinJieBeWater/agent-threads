@@ -26,6 +26,8 @@ export interface TrackedThreadSource {
   parserVersion: number;
 }
 
+export interface TrackedSourceFile extends TrackedThreadSource {}
+
 export interface IndexedThreadRow extends Record<string, unknown> {
   thread_id: string;
   rollout_path: string | null;
@@ -56,8 +58,11 @@ export interface IndexedThreadRow extends Record<string, unknown> {
   file_exists: number | null;
 }
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 5;
 export const PARSER_VERSION = 1;
+const THREAD_INSERT_CHUNK_SIZE = 500;
+const MESSAGE_INSERT_CHUNK_SIZE = 1000;
+const THREAD_SOURCE_UPSERT_CHUNK_SIZE = 1000;
 
 const NOISY_TEXT_PATTERNS = [
   "# AGENTS.md instructions",
@@ -86,10 +91,6 @@ function isNoisyText(value: string | null | undefined): boolean {
   return NOISY_TEXT_PATTERNS.some((pattern) => normalized.includes(pattern));
 }
 
-function findFirstMeaningfulUserMessage(messages: MessageRecord[]): MessageRecord | undefined {
-  return messages.find((message) => message.role === "user" && !isNoisyText(message.text));
-}
-
 function cleanTitleCandidate(value: string | null | undefined): string | null {
   return !value || isNoisyText(value) ? null : value;
 }
@@ -106,6 +107,14 @@ function maxIsoTimestamp(left: string | null | undefined, right: string | null |
   }
 
   return leftTime >= rightTime ? (left as string) : (right as string);
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function getMetaMap(db: IndexDatabase): Effect.Effect<Record<string, string>, CliFailure> {
@@ -143,6 +152,8 @@ export function initializeIndexSchema(db: IndexDatabase): Effect.Effect<void, Cl
   return Effect.all([
     exec(db, "PRAGMA journal_mode = WAL"),
     exec(db, "PRAGMA busy_timeout = 15000"),
+    exec(db, "PRAGMA synchronous = OFF"),
+    exec(db, "PRAGMA temp_store = MEMORY"),
     exec(db, "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
     exec(
       db,
@@ -198,9 +209,18 @@ export function initializeIndexSchema(db: IndexDatabase): Effect.Effect<void, Cl
     ),
     exec(
       db,
+      `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        text,
+        tokenize = "unicode61 remove_diacritics 0 tokenchars '-_./:#'",
+        content = '',
+        contentless_delete = 1
+      )`,
+    ),
+    exec(
+      db,
       `CREATE TABLE IF NOT EXISTS thread_sources (
-        thread_id TEXT PRIMARY KEY,
-        current_path TEXT NOT NULL,
+        current_path TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
         archived INTEGER NOT NULL,
         size_bytes INTEGER NOT NULL,
         mtime_ms INTEGER NOT NULL,
@@ -216,6 +236,7 @@ export function initializeIndexSchema(db: IndexDatabase): Effect.Effect<void, Cl
     exec(db, "CREATE INDEX IF NOT EXISTS idx_threads_cwd ON threads(cwd)"),
     exec(db, "CREATE INDEX IF NOT EXISTS idx_messages_thread_seq ON messages(thread_id, seq)"),
     exec(db, "CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role)"),
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_thread_sources_thread_id ON thread_sources(thread_id)"),
     exec(db, "CREATE INDEX IF NOT EXISTS idx_thread_sources_path ON thread_sources(current_path)"),
   ]).pipe(Effect.asVoid);
 }
@@ -225,6 +246,7 @@ export function resetIndex(db: IndexDatabase): Effect.Effect<void, CliFailure> {
     exec(db, "DELETE FROM meta"),
     exec(db, "DELETE FROM sync_meta"),
     exec(db, "DELETE FROM thread_sources"),
+    exec(db, "DELETE FROM messages_fts"),
     exec(db, "DELETE FROM messages"),
     exec(db, "DELETE FROM sqlite_sequence WHERE name = 'messages'"),
     exec(db, "DELETE FROM threads"),
@@ -232,12 +254,41 @@ export function resetIndex(db: IndexDatabase): Effect.Effect<void, CliFailure> {
 }
 
 export function readTrackedThreadSources(db: IndexDatabase): Effect.Effect<Map<string, TrackedThreadSource>, CliFailure> {
+  return readTrackedSourceFiles(db).pipe(
+    Effect.map((trackedByPath) => {
+      const trackedByThread = new Map<string, TrackedThreadSource>();
+      for (const tracked of trackedByPath.values()) {
+        const current = trackedByThread.get(tracked.threadId);
+        if (!current) {
+          trackedByThread.set(tracked.threadId, tracked);
+          continue;
+        }
+        const currentMissing = current.missingSince !== null ? 1 : 0;
+        const nextMissing = tracked.missingSince !== null ? 1 : 0;
+        if (nextMissing < currentMissing) {
+          trackedByThread.set(tracked.threadId, tracked);
+          continue;
+        }
+        if (tracked.archived < current.archived) {
+          trackedByThread.set(tracked.threadId, tracked);
+          continue;
+        }
+        if (tracked.mtimeMs > current.mtimeMs) {
+          trackedByThread.set(tracked.threadId, tracked);
+        }
+      }
+      return trackedByThread;
+    }),
+  );
+}
+
+export function readTrackedSourceFiles(db: IndexDatabase): Effect.Effect<Map<string, TrackedSourceFile>, CliFailure> {
   return all<Record<string, unknown>>(
     db,
     `
       SELECT
-        thread_id,
         current_path,
+        thread_id,
         archived,
         size_bytes,
         mtime_ms,
@@ -248,9 +299,9 @@ export function readTrackedThreadSources(db: IndexDatabase): Effect.Effect<Map<s
     `,
   ).pipe(
     Effect.map((rows) => {
-      const tracked = new Map<string, TrackedThreadSource>();
+      const tracked = new Map<string, TrackedSourceFile>();
       for (const row of rows) {
-        tracked.set(String(row.thread_id), {
+        tracked.set(String(row.current_path), {
           threadId: String(row.thread_id),
           currentPath: String(row.current_path),
           archived: Number(row.archived ?? 0) === 1 ? 1 : 0,
@@ -282,11 +333,11 @@ export function upsertThreadSource(
   return exec(
     db,
     `INSERT INTO thread_sources (
-      thread_id, current_path, archived, size_bytes, mtime_ms, last_seen_at,
+      current_path, thread_id, archived, size_bytes, mtime_ms, last_seen_at,
       missing_since, last_state_updated_at, parser_version
     ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
-    ON CONFLICT(thread_id) DO UPDATE SET
-      current_path = excluded.current_path,
+    ON CONFLICT(current_path) DO UPDATE SET
+      thread_id = excluded.thread_id,
       archived = excluded.archived,
       size_bytes = excluded.size_bytes,
       mtime_ms = excluded.mtime_ms,
@@ -294,8 +345,8 @@ export function upsertThreadSource(
       missing_since = NULL,
       last_state_updated_at = excluded.last_state_updated_at,
       parser_version = excluded.parser_version`,
-    threadId,
     snapshot.path,
+    threadId,
     snapshot.archived,
     snapshot.sizeBytes,
     snapshot.mtimeMs,
@@ -303,6 +354,50 @@ export function upsertThreadSource(
     lastStateUpdatedAt,
     PARSER_VERSION,
   );
+}
+
+export function upsertThreadSources(
+  db: IndexDatabase,
+  rows: Array<{
+    threadId: string;
+    snapshot: SourceFileSnapshot;
+    lastStateUpdatedAt: number;
+    seenAt: string;
+  }>,
+): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    for (const chunk of chunkArray(rows, THREAD_SOURCE_UPSERT_CHUNK_SIZE)) {
+      const placeholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, NULL, ?, ?)").join(", ");
+      const params = chunk.flatMap(({ threadId, snapshot, lastStateUpdatedAt, seenAt }) => [
+        snapshot.path,
+        threadId,
+        snapshot.archived,
+        snapshot.sizeBytes,
+        snapshot.mtimeMs,
+        seenAt,
+        lastStateUpdatedAt,
+        PARSER_VERSION,
+      ]);
+
+      yield* exec(
+        db,
+        `INSERT INTO thread_sources (
+          current_path, thread_id, archived, size_bytes, mtime_ms, last_seen_at,
+          missing_since, last_state_updated_at, parser_version
+        ) VALUES ${placeholders}
+        ON CONFLICT(current_path) DO UPDATE SET
+          thread_id = excluded.thread_id,
+          archived = excluded.archived,
+          size_bytes = excluded.size_bytes,
+          mtime_ms = excluded.mtime_ms,
+          last_seen_at = excluded.last_seen_at,
+          missing_since = NULL,
+          last_state_updated_at = excluded.last_state_updated_at,
+          parser_version = excluded.parser_version`,
+        ...params,
+      );
+    }
+  }).pipe(Effect.asVoid);
 }
 
 export function markThreadSourceMissing(
@@ -334,6 +429,27 @@ export function markThreadSourceMissing(
 
 export function deleteThreadSource(db: IndexDatabase, threadId: string): Effect.Effect<void, CliFailure> {
   return exec(db, `DELETE FROM thread_sources WHERE thread_id = ?`, threadId);
+}
+
+export function deleteTrackedSourcePath(db: IndexDatabase, path: string): Effect.Effect<void, CliFailure> {
+  return exec(db, `DELETE FROM thread_sources WHERE current_path = ?`, path);
+}
+
+export function touchThreadSourcesMetadata(
+  db: IndexDatabase,
+  threadId: string,
+  lastStateUpdatedAt: number,
+  seenAt: string,
+): Effect.Effect<void, CliFailure> {
+  return exec(
+    db,
+    `UPDATE thread_sources
+      SET last_state_updated_at = ?, last_seen_at = ?, missing_since = NULL
+      WHERE thread_id = ?`,
+    lastStateUpdatedAt,
+    seenAt,
+    threadId,
+  );
 }
 
 export function insertThread(db: IndexDatabase, thread: ThreadRecord): Effect.Effect<void, CliFailure> {
@@ -380,15 +496,64 @@ export function insertThread(db: IndexDatabase, thread: ThreadRecord): Effect.Ef
   );
 }
 
-export function insertMessages(db: IndexDatabase, messages: MessageRecord[]): Effect.Effect<void, CliFailure> {
-  return Effect.forEach(
-    messages,
-    (message) =>
-      exec(
+export function insertThreads(db: IndexDatabase, threads: ThreadRecord[]): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    for (const chunk of chunkArray(threads, THREAD_INSERT_CHUNK_SIZE)) {
+      const placeholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const params = chunk.flatMap((thread) => [
+        thread.threadId,
+        thread.rolloutPath ?? "",
+        thread.createdAt ?? 0,
+        thread.updatedAt ?? 0,
+        thread.source ?? "",
+        thread.modelProvider ?? "",
+        thread.cwd ?? "",
+        thread.title ?? "",
+        thread.sandboxPolicy ?? "",
+        thread.approvalMode ?? "",
+        thread.tokensUsed ?? 0,
+        thread.archived,
+        thread.archivedAt ?? 0,
+        thread.gitSha ?? "",
+        thread.gitBranch ?? "",
+        thread.gitOriginUrl ?? "",
+        thread.cliVersion ?? "",
+        thread.firstUserMessage ?? "",
+        thread.agentNickname ?? "",
+        thread.agentRole ?? "",
+        thread.memoryMode ?? "",
+        thread.model ?? "",
+        thread.reasoningEffort ?? "",
+        thread.agentPath ?? "",
+        thread.sourceFile ?? "",
+        thread.sourceKind,
+        thread.fileExists,
+        thread.messageCount,
+        thread.userMessageCount,
+        thread.assistantMessageCount,
+        thread.lastMessageAt ?? "",
+      ]);
+
+      yield* exec(
         db,
-        `INSERT INTO messages (
-          thread_id, seq, message_ref, role, kind, phase, text, created_at, source_file, source_line
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO threads (
+          thread_id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+          sandbox_policy, approval_mode, tokens_used, archived, archived_at, git_sha, git_branch,
+          git_origin_url, cli_version, first_user_message, agent_nickname, agent_role, memory_mode,
+          model, reasoning_effort, agent_path, source_file, source_kind, file_exists, message_count,
+          user_message_count, assistant_message_count, last_message_at
+        ) VALUES ${placeholders}`,
+        ...params,
+      );
+    }
+  }).pipe(Effect.asVoid);
+}
+
+export function insertMessages(db: IndexDatabase, messages: MessageRecord[]): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    for (const chunk of chunkArray(messages, MESSAGE_INSERT_CHUNK_SIZE)) {
+      const messagePlaceholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const messageParams = chunk.flatMap((message) => [
         message.threadId,
         message.seq,
         message.messageRef,
@@ -399,13 +564,69 @@ export function insertMessages(db: IndexDatabase, messages: MessageRecord[]): Ef
         message.createdAt ?? "",
         message.sourceFile,
         message.sourceLine,
-      ),
-    { discard: true },
-  ).pipe(Effect.asVoid);
+      ]);
+
+      const insertedRows = yield* all<{ message_pk: number; text: string }>(
+        db,
+        `INSERT INTO messages (
+          thread_id, seq, message_ref, role, kind, phase, text, created_at, source_file, source_line
+        ) VALUES ${messagePlaceholders}
+        RETURNING message_pk, text`,
+        ...messageParams,
+      );
+
+      if (insertedRows.length === 0) {
+        continue;
+      }
+
+      const ftsPlaceholders = insertedRows.map(() => "(?, ?)").join(", ");
+      const ftsParams = insertedRows.flatMap((row) => [row.message_pk, row.text]);
+      yield* exec(db, `INSERT INTO messages_fts(rowid, text) VALUES ${ftsPlaceholders}`, ...ftsParams);
+    }
+  }).pipe(Effect.asVoid);
+}
+
+export function insertMessagesTableOnly(db: IndexDatabase, messages: MessageRecord[]): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    for (const chunk of chunkArray(messages, MESSAGE_INSERT_CHUNK_SIZE)) {
+      const messagePlaceholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const messageParams = chunk.flatMap((message) => [
+        message.threadId,
+        message.seq,
+        message.messageRef,
+        message.role,
+        message.kind,
+        message.phase ?? "",
+        message.text,
+        message.createdAt ?? "",
+        message.sourceFile,
+        message.sourceLine,
+      ]);
+
+      yield* exec(
+        db,
+        `INSERT INTO messages (
+          thread_id, seq, message_ref, role, kind, phase, text, created_at, source_file, source_line
+        ) VALUES ${messagePlaceholders}`,
+        ...messageParams,
+      );
+    }
+  }).pipe(Effect.asVoid);
+}
+
+export function rebuildMessagesFtsFromMessages(db: IndexDatabase): Effect.Effect<void, CliFailure> {
+  return exec(
+    db,
+    `INSERT INTO messages_fts(rowid, text)
+     SELECT message_pk, text
+     FROM messages
+     ORDER BY message_pk ASC`,
+  );
 }
 
 export function deleteThreadData(db: IndexDatabase, threadId: string): Effect.Effect<void, CliFailure> {
   return Effect.all([
+    exec(db, `DELETE FROM messages_fts WHERE rowid IN (SELECT message_pk FROM messages WHERE thread_id = ?)`, threadId),
     exec(db, `DELETE FROM messages WHERE thread_id = ?`, threadId),
     exec(db, `DELETE FROM threads WHERE thread_id = ?`, threadId),
   ]).pipe(Effect.asVoid);
@@ -446,9 +667,62 @@ export function refreshIndexMeta(
   });
 }
 
+export function refreshIndexMetaFromTrackedSources(
+  db: IndexDatabase,
+  paths: ResolvedPaths,
+  builtAt: string,
+): Effect.Effect<void, CliFailure> {
+  return Effect.gen(function* () {
+    const totals = yield* get<Record<string, unknown>>(
+      db,
+      `
+        SELECT
+          COUNT(*) AS thread_count,
+          COALESCE(SUM(message_count), 0) AS message_count
+        FROM threads
+      `,
+    ).pipe(
+      Effect.map((row) => ({
+        threadCount: Number(row?.thread_count ?? 0),
+        messageCount: Number(row?.message_count ?? 0),
+      })),
+    );
+
+    const sourceCounts = yield* get<Record<string, unknown>>(
+      db,
+      `
+        SELECT
+          SUM(CASE WHEN archived = 0 AND missing_since IS NULL THEN 1 ELSE 0 END) AS active_session_file_count,
+          SUM(CASE WHEN archived = 1 AND missing_since IS NULL THEN 1 ELSE 0 END) AS archived_session_file_count
+        FROM thread_sources
+      `,
+    ).pipe(
+      Effect.map((row) => ({
+        activeSessionFileCount: Number(row?.active_session_file_count ?? 0),
+        archivedSessionFileCount: Number(row?.archived_session_file_count ?? 0),
+      })),
+    );
+
+    yield* upsertKeyValues(db, "meta", {
+      built_at: builtAt,
+      thread_count: String(totals.threadCount),
+      message_count: String(totals.messageCount),
+      active_session_file_count: String(sourceCounts.activeSessionFileCount),
+      archived_session_file_count: String(sourceCounts.archivedSessionFileCount),
+      source_state_db_path: paths.stateDb,
+      source_id: paths.sourceId,
+      source_kind: paths.sourceKind,
+      source_root: paths.sourceRoot,
+    });
+  });
+}
+
 export function refreshSyncMeta(
   db: IndexDatabase,
   stateDbMtime: number | null,
+  sourceFingerprint: string | null,
+  sourceDirectoryManifest: string | null,
+  logsHighWater: number | null,
   syncedAt: string,
 ): Effect.Effect<void, CliFailure> {
   return upsertKeyValues(db, "sync_meta", {
@@ -456,16 +730,10 @@ export function refreshSyncMeta(
     parser_version: String(PARSER_VERSION),
     last_sync_at: syncedAt,
     last_state_db_mtime_ms: String(stateDbMtime ?? 0),
+    last_source_fingerprint: sourceFingerprint ?? "",
+    last_source_directory_manifest: sourceDirectoryManifest ?? "",
+    last_logs_high_water: String(logsHighWater ?? 0),
   });
-}
-
-export function buildCanonicalMessages(threadId: string, messages: MessageRecord[]): MessageRecord[] {
-  return messages.map((message, index) => ({
-    ...message,
-    threadId,
-    seq: index + 1,
-    messageRef: `${threadId}:${index + 1}`,
-  }));
 }
 
 export function chooseCanonicalSnapshot(
@@ -497,11 +765,12 @@ export function buildThreadRecordFromSessions(
   if (!firstParsed) {
     throw new Error("buildThreadRecordFromSessions requires at least one parsed session");
   }
+  const canonicalThreadId = firstParsed.threadId;
 
   const thread = stateThread
     ? { ...stateThread }
     : ({
-        threadId: firstParsed.threadId,
+        threadId: canonicalThreadId,
         rolloutPath: null,
         createdAt: null,
         updatedAt: null,
@@ -534,8 +803,11 @@ export function buildThreadRecordFromSessions(
         lastMessageAt: null,
       } satisfies ThreadRecord);
 
-  const collectedMessages: MessageRecord[] = [];
+  const canonicalMessages: MessageRecord[] = [];
   let canonicalSource: SourceFileSnapshot | null = null;
+  let lastMessageAt = thread.lastMessageAt;
+  let userMessageCount = 0;
+  let assistantMessageCount = 0;
 
   for (const parsed of parsedSessions) {
     thread.sourceFile = parsed.meta.sourceFile ?? thread.sourceFile;
@@ -547,17 +819,36 @@ export function buildThreadRecordFromSessions(
     thread.source = parsed.meta.source ?? thread.source;
     thread.cliVersion = parsed.meta.cliVersion ?? thread.cliVersion;
 
-    collectedMessages.push(...parsed.messages);
+    let parsedFirstMeaningfulUser: string | null = null;
+    let parsedFirstUser: string | null = null;
+    for (const message of parsed.messages) {
+      if (message.role === "user") {
+        userMessageCount += 1;
+        parsedFirstUser ??= message.text;
+        if (!isNoisyText(message.text)) {
+          parsedFirstMeaningfulUser ??= message.text;
+        }
+      } else if (message.role === "assistant") {
+        assistantMessageCount += 1;
+      }
 
-    const firstMeaningfulUser = findFirstMeaningfulUserMessage(parsed.messages);
-    const firstUser = parsed.messages.find((message) => message.role === "user");
+      const seq = canonicalMessages.length + 1;
+      canonicalMessages.push({
+        ...message,
+        threadId: canonicalThreadId,
+        seq,
+        messageRef: `${canonicalThreadId}:${seq}`,
+      });
+      lastMessageAt = maxIsoTimestamp(lastMessageAt, message.createdAt);
+    }
+
     if (!thread.firstUserMessage) {
-      thread.firstUserMessage = firstMeaningfulUser?.text ?? firstUser?.text ?? null;
+      thread.firstUserMessage = parsedFirstMeaningfulUser ?? parsedFirstUser ?? null;
     }
     thread.title = chooseThreadTitle({
       stateTitle: cleanTitleCandidate(thread.title),
       sessionTitle: cleanTitleCandidate(parsed.meta.title ?? null),
-      firstUserMessage: cleanTitleCandidate(firstMeaningfulUser?.text ?? thread.firstUserMessage),
+      firstUserMessage: cleanTitleCandidate(parsedFirstMeaningfulUser ?? thread.firstUserMessage),
     });
 
     if (!thread.rolloutPath && parsed.meta.sourceFile) {
@@ -570,23 +861,13 @@ export function buildThreadRecordFromSessions(
     }
   }
 
-  const canonicalMessages = buildCanonicalMessages(firstParsed.threadId, collectedMessages);
   thread.messageCount = canonicalMessages.length;
-  thread.userMessageCount = canonicalMessages.filter((message) => message.role === "user").length;
-  thread.assistantMessageCount = canonicalMessages.filter((message) => message.role === "assistant").length;
-  thread.lastMessageAt = canonicalMessages.reduce<string | null>(
-    (latest, message) => maxIsoTimestamp(latest, message.createdAt),
-    thread.lastMessageAt,
-  );
-
-  const firstMeaningfulUser = findFirstMeaningfulUserMessage(canonicalMessages);
-  const firstUser = canonicalMessages.find((message) => message.role === "user");
-  if (!thread.firstUserMessage) {
-    thread.firstUserMessage = firstMeaningfulUser?.text ?? firstUser?.text ?? null;
-  }
+  thread.userMessageCount = userMessageCount;
+  thread.assistantMessageCount = assistantMessageCount;
+  thread.lastMessageAt = lastMessageAt;
   thread.title = chooseThreadTitle({
     stateTitle: cleanTitleCandidate(thread.title),
-    firstUserMessage: cleanTitleCandidate(firstMeaningfulUser?.text ?? thread.firstUserMessage),
+    firstUserMessage: cleanTitleCandidate(thread.firstUserMessage),
   });
 
   if (canonicalSource) {
@@ -770,14 +1051,17 @@ export function isIndexUsable(paths: ResolvedPaths): Effect.Effect<boolean, CliF
       Effect.gen(function* () {
         const tables = yield* all<{ name: string }>(
           db,
-          `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('messages', 'threads', 'thread_sources', 'sync_meta')`,
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('messages', 'messages_fts', 'threads', 'thread_sources', 'sync_meta')`,
         );
-        if (tables.length < 4) {
+        if (tables.length < 5) {
           return false;
         }
 
         const syncMeta = yield* getSyncMetaMap(db);
         if (Number(syncMeta.schema_version ?? 0) !== SCHEMA_VERSION) {
+          return false;
+        }
+        if (Number(syncMeta.parser_version ?? 0) !== PARSER_VERSION) {
           return false;
         }
 
@@ -819,7 +1103,7 @@ export function trackedSourceNeedsRebuild(
     tracked.currentPath !== snapshot.path ||
     tracked.archived !== snapshot.archived ||
     tracked.sizeBytes !== snapshot.sizeBytes ||
-    tracked.mtimeMs !== snapshot.mtimeMs ||
+    tracked.mtimeMs !== Math.floor(snapshot.mtimeMs) ||
     tracked.parserVersion !== PARSER_VERSION ||
     tracked.missingSince !== null
   );

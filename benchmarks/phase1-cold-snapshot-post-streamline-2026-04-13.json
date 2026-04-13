@@ -1,0 +1,17 @@
+{
+  "capturedAt": "2026-04-13T11:30:00.000Z",
+  "implementation": "phase1 words-first fts with selective sync, bulk rebuild backfill, and streamlined canonical thread build",
+  "sourceRoot": "/tmp/ath-codex-snapshot-1776076381",
+  "results": [
+    {
+      "name": "cold_inspect_index",
+      "command": ["inspect", "index"],
+      "elapsedMs": 5620.92
+    },
+    {
+      "name": "admin_reindex",
+      "command": ["admin", "reindex"],
+      "elapsedMs": 5819.35
+    }
+  ]
+}
