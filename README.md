@@ -261,9 +261,9 @@ Current performance notes:
 - Warm-path performance work now centers on keeping trusted-manifest sync cheap and selective.
 - If rebuild or cold-start latency becomes the next bottleneck, start with SQLite FTS5
   bulk-load / merge / optimize experiments before touching the steady-state query path.
-- See the phase-specific notes under `docs/`, especially:
-  - `docs/performance-phase1-live-final-2026-04-13.md`
-  - `docs/performance-phase1-cold-post-batch-2026-04-13.md`
+- The single authoritative before/after comparison is:
+  - `docs/fts-before-after-summary-2026-04-13.md`
+- Other `docs/performance-*.md` files are supporting raw records, not the primary conclusion.
 
 ## Output Notes
 
