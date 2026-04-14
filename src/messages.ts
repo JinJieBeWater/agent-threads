@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 
 import { all, get, withDatabase } from "./infra/sqlite.ts";
-import { buildSnippet, isNoisyText } from "./threads.ts";
+import { buildSnippet, isNoisyText, matchesSearchText } from "./threads.ts";
 import type { CliFailure } from "./errors.ts";
 import type { ResolvedPaths } from "./types.ts";
 
@@ -34,6 +34,99 @@ function shouldFallbackToContainsAfterMiss(query: string): boolean {
 function toFtsMatchQuery(query: string): string {
   const normalized = normalizeQuery(query);
   return `"${normalized.replaceAll('"', '""')}"`;
+}
+
+function candidateLimit(limit: number): number {
+  return Math.max(limit * 10, limit);
+}
+
+function metadataHitDetails(
+  title: unknown,
+  firstUserMessage: unknown,
+  query: string,
+): {
+  title_hit: 0 | 1;
+  first_user_message_hit: 0 | 1;
+  metadata_hit_score: number;
+} {
+  const titleHit = matchesSearchText(typeof title === "string" ? title : null, query) ? 1 : 0;
+  const firstUserMessageHit = matchesSearchText(
+    typeof firstUserMessage === "string" ? firstUserMessage : null,
+    query,
+  )
+    ? 1
+    : 0;
+  return {
+    title_hit: titleHit,
+    first_user_message_hit: firstUserMessageHit,
+    metadata_hit_score: titleHit * 2 + firstUserMessageHit,
+  };
+}
+
+function dedupeMessageRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const seenThreadIds = new Set<string>();
+  const deduped: Array<Record<string, unknown>> = [];
+  for (const row of rows) {
+    const threadId = String(row.thread_id ?? "");
+    if (seenThreadIds.has(threadId)) {
+      continue;
+    }
+    seenThreadIds.add(threadId);
+    deduped.push(row);
+  }
+  return deduped;
+}
+
+const META_DISCUSSION_PATTERNS = [
+  "you are reviewing",
+  "ground your review",
+  "return concise review",
+  "no code changes",
+  "phase 1 fts",
+  "trigram",
+  "benchmark",
+  "baseline",
+  "reindex",
+  "ensureindex",
+  "selective sync",
+  "static snapshot",
+  "warm read",
+  "review this planned",
+];
+
+function isBroadNaturalLanguageQuery(query: string): boolean {
+  const normalized = normalizeQuery(query);
+  return normalized.includes(" ") && !/[_./:#-]/.test(normalized);
+}
+
+function metaDiscussionPenalty(
+  row: {
+    title?: unknown;
+    first_user_message?: unknown;
+    text_snippet?: unknown;
+  },
+  query: string,
+): number {
+  const normalizedQuery = normalizeQuery(query).toLowerCase();
+  if (/(ath|agent-threads|fts|trigram|benchmark|reindex|search|index)/.test(normalizedQuery)) {
+    return 0;
+  }
+
+  const title = typeof row.title === "string" ? row.title : "";
+  const firstUserMessage = typeof row.first_user_message === "string" ? row.first_user_message : "";
+  const snippet = typeof row.text_snippet === "string" ? row.text_snippet : "";
+  const combined = `${title}\n${firstUserMessage}\n${snippet}`.toLowerCase();
+
+  let penalty = 0;
+  for (const pattern of META_DISCUSSION_PATTERNS) {
+    if (combined.includes(pattern)) {
+      penalty += 1;
+    }
+  }
+  if (title.length > 180 || firstUserMessage.length > 300) {
+    penalty += 1;
+  }
+  return penalty;
 }
 
 function searchMessagesByContains(
@@ -78,7 +171,7 @@ function searchMessagesByContains(
         params.push(options.untilIso);
       }
 
-      params.push(Math.max(options.limit * 5, options.limit));
+      params.push(candidateLimit(options.limit));
       const rows = yield* all<Record<string, unknown>>(
         db,
         `
@@ -92,6 +185,7 @@ function searchMessagesByContains(
               m.text,
               m.created_at,
               t.title,
+              t.first_user_message,
               t.model_provider,
               t.cwd
             FROM messages m
@@ -103,9 +197,10 @@ function searchMessagesByContains(
         ...params,
       );
 
-      return rows
+      const rankedRows = rows
         .map((row) => {
           const text = String(row.text ?? "");
+          const metadata = metadataHitDetails(row.title, row.first_user_message, options.query);
           return {
             thread_id: row.thread_id,
             seq: row.seq,
@@ -116,21 +211,40 @@ function searchMessagesByContains(
             text_snippet: buildSnippet(text, options.query),
             created_at: row.created_at,
             title: row.title,
+            first_user_message: row.first_user_message,
             model_provider: row.model_provider,
             cwd: row.cwd,
             noisy_match: isNoisyText(text) ? 1 : 0,
+            meta_discussion_penalty: 0,
+            ...metadata,
           };
         })
+        .map((row) => ({
+          ...row,
+          meta_discussion_penalty: metaDiscussionPenalty(row, options.query),
+        }))
         .sort((left, right) => {
           const noisyDelta = Number(left.noisy_match) - Number(right.noisy_match);
           if (noisyDelta !== 0) {
             return noisyDelta;
           }
+          const metaDiscussionDelta =
+            isBroadNaturalLanguageQuery(options.query)
+              ? Number(left.meta_discussion_penalty ?? 0) - Number(right.meta_discussion_penalty ?? 0)
+              : 0;
+          if (metaDiscussionDelta !== 0) {
+            return metaDiscussionDelta;
+          }
+          const metadataDelta = Number(right.metadata_hit_score ?? 0) - Number(left.metadata_hit_score ?? 0);
+          if (metadataDelta !== 0) {
+            return metadataDelta;
+          }
           const leftCreatedAt = typeof left.created_at === "string" ? Date.parse(left.created_at) : 0;
           const rightCreatedAt = typeof right.created_at === "string" ? Date.parse(right.created_at) : 0;
           return rightCreatedAt - leftCreatedAt;
-        })
-        .slice(0, options.limit);
+        });
+
+      return dedupeMessageRows(rankedRows).slice(0, options.limit);
     }),
   );
 }
@@ -177,7 +291,7 @@ function searchMessagesByFts(
         params.push(options.untilIso);
       }
 
-      params.push(Math.max(options.limit * 5, options.limit));
+      params.push(candidateLimit(options.limit));
       const rows = yield* all<Record<string, unknown>>(
         db,
         `
@@ -191,6 +305,7 @@ function searchMessagesByFts(
               m.text,
               m.created_at,
               t.title,
+              t.first_user_message,
               t.model_provider,
               t.cwd,
               bm25(messages_fts) AS search_rank
@@ -204,9 +319,10 @@ function searchMessagesByFts(
         ...params,
       );
 
-      return rows
+      const rankedRows = rows
         .map((row) => {
           const text = String(row.text ?? "");
+          const metadata = metadataHitDetails(row.title, row.first_user_message, options.query);
           return {
             thread_id: row.thread_id,
             seq: row.seq,
@@ -217,16 +333,34 @@ function searchMessagesByFts(
             text_snippet: buildSnippet(text, options.query),
             created_at: row.created_at,
             title: row.title,
+            first_user_message: row.first_user_message,
             model_provider: row.model_provider,
             cwd: row.cwd,
             noisy_match: isNoisyText(text) ? 1 : 0,
             search_rank: Number(row.search_rank ?? 0),
+            meta_discussion_penalty: 0,
+            ...metadata,
           };
         })
+        .map((row) => ({
+          ...row,
+          meta_discussion_penalty: metaDiscussionPenalty(row, options.query),
+        }))
         .sort((left, right) => {
           const noisyDelta = Number(left.noisy_match) - Number(right.noisy_match);
           if (noisyDelta !== 0) {
             return noisyDelta;
+          }
+          const metaDiscussionDelta =
+            isBroadNaturalLanguageQuery(options.query)
+              ? Number(left.meta_discussion_penalty ?? 0) - Number(right.meta_discussion_penalty ?? 0)
+              : 0;
+          if (metaDiscussionDelta !== 0) {
+            return metaDiscussionDelta;
+          }
+          const metadataDelta = Number(right.metadata_hit_score ?? 0) - Number(left.metadata_hit_score ?? 0);
+          if (metadataDelta !== 0) {
+            return metadataDelta;
           }
           const rankDelta = Number(left.search_rank ?? 0) - Number(right.search_rank ?? 0);
           if (rankDelta !== 0) {
@@ -236,8 +370,9 @@ function searchMessagesByFts(
           const rightCreatedAt = typeof right.created_at === "string" ? Date.parse(right.created_at) : 0;
           return rightCreatedAt - leftCreatedAt;
         })
-        .map(({ search_rank, ...row }) => row)
-        .slice(0, options.limit);
+        .map(({ search_rank, ...row }) => row);
+
+      return dedupeMessageRows(rankedRows).slice(0, options.limit);
     }),
   );
 }

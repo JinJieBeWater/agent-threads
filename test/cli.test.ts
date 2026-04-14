@@ -1156,6 +1156,130 @@ test("message search supports code-ish tokens with punctuation", () => {
   expect(punctuatedPayload.data.results[0]?.thread_id).toBe("tokenchars");
 });
 
+test("find --kind message keeps only the strongest hit per thread", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-dedupe-a.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "dedupe-a",
+        title: "Dedupe thread A",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "assistant", text: "needle alpha" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "needle beta" },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-dedupe-b.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "dedupe-b",
+        title: "Dedupe thread B",
+        messages: [{ timestamp: "2026-04-11T02:43:32.000Z", role: "assistant", text: "needle gamma" }],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(["--json", "--refresh", "find", "needle", "--kind", "message", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results.map((row) => row.thread_id)).toEqual(["dedupe-b", "dedupe-a"]);
+});
+
+test("find --kind message boosts title and first-user-message matches ahead of plain message hits", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-rank-title.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "rank-title",
+        title: "Payment callback fix",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "user", text: "unrelated setup" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "payment token" },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-rank-first-user.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "rank-first-user",
+        title: "Other thread",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "user", text: "Need payment flow help" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "payment token" },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-rank-plain.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "rank-plain",
+        title: "Other thread",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "user", text: "unrelated setup" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "payment token" },
+        ],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(["--json", "--refresh", "find", "payment", "--kind", "message", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results.map((row) => row.thread_id)).toEqual([
+    "rank-title",
+    "rank-first-user",
+    "rank-plain",
+  ]);
+  expect(payload.data.results[0]?.why_matched).toEqual(["message", "title"]);
+  expect(payload.data.results[1]?.why_matched).toEqual(["message", "first_user_message"]);
+});
+
+test("find --kind message downranks meta discussion for broad natural-language queries", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-real-error.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "real-error",
+        title: "Payment callback issue",
+        messages: [
+          { timestamp: "2026-04-11T02:43:30.000Z", role: "user", text: "Need better error handling for callback retries" },
+          { timestamp: "2026-04-11T02:43:31.000Z", role: "assistant", text: "We should improve error handling in the payment callback path." },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-meta-error.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "meta-error",
+        title:
+          "You are reviewing a planned change. Return concise review with error handling notes.",
+        messages: [
+          { timestamp: "2026-04-11T02:43:40.000Z", role: "user", text: "Ground your review and discuss error handling strategy." },
+          { timestamp: "2026-04-11T02:43:41.000Z", role: "assistant", text: "No code changes. Review the error handling approach only." },
+        ],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(["--json", "--refresh", "find", "error handling", "--kind", "message", "--limit", "5"], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results[0]?.thread_id).toBe("real-error");
+  expect(payload.data.results[1]?.thread_id).toBe("meta-error");
+});
+
 test("incremental sync refreshes message FTS hits without leaving stale matches", () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");

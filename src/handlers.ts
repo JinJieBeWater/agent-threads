@@ -284,6 +284,13 @@ function buildFindMessageResult(row: Record<string, unknown>, index: number): Re
   const threadId = String(row.thread_id);
   const seq = Number(row.seq);
   const createdAt = formatIsoTimestamp(row.created_at);
+  const whyMatched = ["message"];
+  if (Number(row.title_hit ?? 0) > 0) {
+    whyMatched.push("title");
+  }
+  if (Number(row.first_user_message_hit ?? 0) > 0) {
+    whyMatched.push("first_user_message");
+  }
   return {
     kind: "message",
     target: `thread:${threadId}:${seq}`,
@@ -295,7 +302,7 @@ function buildFindMessageResult(row: Record<string, unknown>, index: number): Re
     created_at: createdAt,
     provider: row.model_provider ?? null,
     cwd: row.cwd ?? null,
-    why_matched: ["message"],
+    why_matched: whyMatched,
     _rank: 1_000 - index,
     _timestamp: createdAt ? Date.parse(createdAt) : 0,
     _noisy: Number(row.noisy_match ?? 0),
