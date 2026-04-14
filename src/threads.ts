@@ -184,7 +184,7 @@ export function buildSnippet(value: string, query: string, maxLength = SNIPPET_L
   return snippet;
 }
 
-function matchesSearchText(value: string | null | undefined, query: string): boolean {
+export function matchesSearchText(value: string | null | undefined, query: string): boolean {
   const normalizedValue = typeof value === "string" ? normalizeSearchText(value) : "";
   const normalizedQuery = normalizeSearchText(query);
   if (normalizedValue.length === 0 || normalizedQuery.length === 0) {
