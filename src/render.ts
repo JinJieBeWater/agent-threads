@@ -192,6 +192,43 @@ export function renderStats(stats: Record<string, unknown>): string {
   return `${totals}\n\nProviders\n${providers || "- none"}\n\nTop CWDs\n${topCwds || "- none"}`;
 }
 
+export function renderObservedPaths(results: Array<Record<string, unknown>>): string {
+  if (results.length === 0) {
+    return "No session paths matched.";
+  }
+
+  return results
+    .map((result) => {
+      const pathKind = typeof result.path_kind === "string" ? result.path_kind : "cwd";
+      const cwd = typeof result.cwd === "string" ? result.cwd : "-";
+      const threadCount = Number(result.thread_count ?? 0);
+      const lastUpdatedAt = typeof result.last_updated_at === "string" ? result.last_updated_at : "-";
+      const liveStatus = typeof result.live_status === "string" ? result.live_status : "unknown";
+      const recommendedScope =
+        result.recommended_scope && typeof result.recommended_scope === "object"
+          ? (result.recommended_scope as Record<string, unknown>)
+          : null;
+      const scopeFlag = typeof recommendedScope?.flag === "string" ? recommendedScope.flag : "--cwd";
+      const scopeValue = typeof recommendedScope?.value === "string" ? recommendedScope.value : cwd;
+      const branch = typeof result.sample_branch === "string" ? result.sample_branch : null;
+      const origin = typeof result.sample_origin === "string" ? result.sample_origin : null;
+      const details = [
+        `threads: ${threadCount}`,
+        `updated: ${lastUpdatedAt}`,
+        `live: ${liveStatus}`,
+        `scope: ${scopeFlag} ${scopeValue}`,
+      ];
+      if (branch) {
+        details.push(`branch: ${branch}`);
+      }
+      if (origin) {
+        details.push(`origin: ${origin}`);
+      }
+      return `[${pathKind}] ${cwd}\n${details.join("  ")}`;
+    })
+    .join("\n\n");
+}
+
 export function renderDoctor(data: Record<string, unknown>): string {
   const lines = [
     `source_id: ${data.sourceId}`,

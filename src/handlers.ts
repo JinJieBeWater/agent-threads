@@ -9,11 +9,20 @@ import { fileExists, removeFile } from "./infra/fs.ts";
 import { ensureIndex, readIndexMeta, rebuildIndex } from "./indexer.ts";
 import { getMessageContext, searchMessages } from "./messages.ts";
 import { runReadOnlySql } from "./request.ts";
-import { getRelatedThreads, getThread, getThreadMessages, getThreadStats, listThreads, searchThreads } from "./threads.ts";
+import {
+  getObservedPaths,
+  getRelatedThreads,
+  getThread,
+  getThreadMessages,
+  getThreadStats,
+  listThreads,
+  searchThreads,
+} from "./threads.ts";
 import type {
   ExportActionOptions,
   FindActionOptions,
   GlobalOptions,
+  InspectActionOptions,
   OpenActionOptions,
   RecentActionOptions,
   ResolvedPaths,
@@ -447,6 +456,8 @@ export function handleFind(
               query: searchQuery,
               provider: actionOptions.provider,
               cwd: actionOptions.cwd,
+              repo: actionOptions.repo,
+              worktree: actionOptions.worktree,
               limit: actionOptions.limit * 3,
               sinceEpochMs,
               untilEpochMs,
@@ -460,6 +471,8 @@ export function handleFind(
               threadId: undefined,
               provider: actionOptions.provider,
               cwd: actionOptions.cwd,
+              repo: actionOptions.repo,
+              worktree: actionOptions.worktree,
               role: actionOptions.role,
               limit: actionOptions.limit * 3,
               sinceIso,
@@ -505,6 +518,8 @@ export function handleRecent(
       const rows = yield* listThreads(paths, {
         provider: actionOptions.provider,
         cwd: actionOptions.cwd,
+        repo: actionOptions.repo,
+        worktree: actionOptions.worktree,
         limit: actionOptions.limit,
         sinceEpochMs,
         untilEpochMs,
@@ -583,6 +598,7 @@ export function handleInspect(
   subject: string,
   value: string | undefined,
   related: boolean,
+  actionOptions: InspectActionOptions,
   options: GlobalOptions,
 ): Effect.Effect<unknown, CliFailure> {
   if (subject === "source") {
@@ -602,6 +618,15 @@ export function handleInspect(
           thread,
           related: related ? yield* getRelatedThreads(paths, threadId, 10) : [],
         };
+      }),
+    );
+  }
+
+  if (subject === "paths") {
+    return withReadyIndex(options, (paths) =>
+      getObservedPaths(paths, {
+        match: actionOptions.match,
+        limit: actionOptions.limit,
       }),
     );
   }

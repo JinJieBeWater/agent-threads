@@ -64,7 +64,12 @@ ath admin reindex
 
 ath find "refactor pattern"
 ath find "retry strategy" --kind message
+ath inspect paths
+ath inspect paths --match mercpay
+ath find "retry strategy" --repo /path/to/repo
+ath find "retry strategy" --worktree /path/to/repo.worktrees/feat-x
 ath recent --limit 20
+ath recent --repo /path/to/repo
 ath recent --since 7d
 ath open <thread-id>
 ath open <thread-id>:12 --before 2 --after 2
@@ -107,12 +112,70 @@ Examples:
 ```bash
 ath --json find "error handling"
 ath --json find "retry strategy" --kind message
+ath --json inspect paths
+ath --json inspect paths --match mercpay
+ath --json find "retry strategy" --repo /path/to/repo
+ath --json find "retry strategy" --worktree /path/to/repo.worktrees/feat-x
 ath --json recent --limit 10
+ath --json recent --repo /path/to/repo
 ath --json recent --since 3d
 ath --json open <thread-id>:12 --before 2 --after 3
 ath --json open <thread-id> --format messages --full
 ath --json inspect index
 ```
+
+## Scope Filters
+
+Use exactly one of these filters on `find` and `recent`:
+
+- `--cwd /path/to/dir`
+  Exact working-directory match only.
+- `--worktree /path/to/repo.worktrees/feat-x`
+  Matches that worktree root and any nested directory below it.
+- `--repo /path/to/repo`
+  Matches the main repo root, nested directories below it, and sibling worktrees under `/path/to/repo.worktrees/*`.
+
+Examples:
+
+```bash
+ath find "payment" --repo /Users/me/src/mercpay
+ath find "payment" --worktree /Users/me/src/mercpay.worktrees/feat-refactor
+ath recent --repo /Users/me/src/mercpay --limit 20
+```
+
+## Agent Usage
+
+For agent workflows, prefer scope-first history search:
+
+1. Ask `ath` which paths already have conversation history:
+
+```bash
+ath --json inspect paths
+ath --json inspect paths --match mercpay
+```
+
+2. Prefer the returned `recommended_scope`, `repo_scope`, `worktree_scope`, and `live_status` fields.
+3. Infer the likely repo or worktree from those observed paths plus the current task, cwd, mentioned paths, or branch context.
+4. If the observed paths are still ambiguous and the current directory is inside a Git repo, resolve the repo and worktrees with Git:
+
+```bash
+git rev-parse --show-toplevel
+git worktree list --porcelain
+```
+
+5. Query `ath` with exactly one scope flag:
+- `--worktree` for one worktree domain
+- `--repo` for the main repo plus sibling `.worktrees/*`
+- `--cwd` only for exact-directory matching
+6. Use unscoped `ath find` or `ath recent` only as a fallback when no plausible scope can be inferred.
+
+Notes:
+
+- `inspect paths` is derived from indexed thread history, so it tells you where sessions already exist.
+- When a returned path still exists, `inspect paths` also attempts live Git resolution and returns `live_status`, `live_repo_scope`, and `live_worktree_scope`.
+- `git worktree list` is authoritative for one repo.
+- `~/.codex/worktrees` can provide extra hints about Codex-managed worktrees, but it is not a complete registry of all worktrees on the machine.
+- Historical Codex thread metadata in `state_5.sqlite` also includes `cwd`, `git_branch`, and `git_origin_url`, which can help infer relevant repo families, but that is historical data, not a live inventory.
 
 ## Search by Time Range
 

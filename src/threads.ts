@@ -1,8 +1,11 @@
+import { sep } from "node:path";
 import { Effect } from "effect";
 
+import { resolveLiveGitScope } from "./infra/git.ts";
 import { all, get, withDatabase } from "./infra/sqlite.ts";
 import type { CliFailure } from "./errors.ts";
-import type { ResolvedPaths } from "./types.ts";
+import { appendQueryScopeClauses, derivePathScopes } from "./query-scope.ts";
+import type { QueryScopeOptions, ResolvedPaths } from "./types.ts";
 
 const SNIPPET_LENGTH = 220;
 const EPOCH_MS_THRESHOLD = 1_000_000_000_000;
@@ -62,6 +65,43 @@ function hasCleanThreadMetadata(title: string | null, firstUserMessage: string |
       firstUserMessage.length > 0 &&
       !isNoisyText(firstUserMessage))
   );
+}
+
+function startsWithScope(path: string, scope: string | null): boolean {
+  return typeof scope === "string" && (path === scope || path.startsWith(`${scope}${sep}`));
+}
+
+function aliasScopePath(cwd: string, resolvedPath: string | null, canonicalScope: string | null): string | null {
+  if (!canonicalScope) {
+    return null;
+  }
+  if (!resolvedPath) {
+    return canonicalScope;
+  }
+
+  const observedDerived = derivePathScopes(cwd);
+  const resolvedDerived = derivePathScopes(resolvedPath);
+  if (observedDerived.pathKind === "worktree" && resolvedDerived.pathKind === "worktree") {
+    if (canonicalScope === resolvedDerived.worktreeScope && observedDerived.worktreeScope) {
+      return observedDerived.worktreeScope;
+    }
+    if (canonicalScope === resolvedDerived.repoScope && observedDerived.repoScope) {
+      return observedDerived.repoScope;
+    }
+  }
+
+  if (resolvedPath === canonicalScope) {
+    return cwd;
+  }
+  if (!resolvedPath.startsWith(`${canonicalScope}${sep}`)) {
+    return canonicalScope;
+  }
+
+  const suffix = resolvedPath.slice(canonicalScope.length + sep.length);
+  if (suffix.length === 0) {
+    return cwd;
+  }
+  return cwd.endsWith(`${sep}${suffix}`) ? cwd.slice(0, cwd.length - suffix.length - sep.length) : canonicalScope;
 }
 
 export function buildSnippet(value: string, query: string, maxLength = SNIPPET_LENGTH): string {
@@ -130,9 +170,8 @@ export function isNoisyText(value: string | null | undefined): boolean {
 
 export function listThreads(
   paths: ResolvedPaths,
-  options: {
+  options: QueryScopeOptions & {
     provider?: string;
-    cwd?: string;
     limit: number;
     sinceEpochMs?: number;
     untilEpochMs?: number;
@@ -148,10 +187,7 @@ export function listThreads(
       where.push("model_provider = ?");
       params.push(options.provider);
     }
-    if (options.cwd) {
-      where.push("cwd = ?");
-      params.push(options.cwd);
-    }
+    appendQueryScopeClauses(where, params, options, "cwd");
     if (typeof options.sinceEpochMs === "number") {
       where.push(`${updatedAtExpression} >= ?`);
       params.push(options.sinceEpochMs);
@@ -188,10 +224,9 @@ export function listThreads(
 
 export function searchThreads(
   paths: ResolvedPaths,
-  options: {
+  options: QueryScopeOptions & {
     query: string;
     provider?: string;
-    cwd?: string;
     limit: number;
     sinceEpochMs?: number;
     untilEpochMs?: number;
@@ -217,10 +252,7 @@ export function searchThreads(
       threadWhere.push("model_provider = ?");
       threadParams.push(options.provider);
     }
-    if (options.cwd) {
-      threadWhere.push("cwd = ?");
-      threadParams.push(options.cwd);
-    }
+    appendQueryScopeClauses(threadWhere, threadParams, options, "cwd");
     if (typeof options.sinceEpochMs === "number") {
       threadWhere.push(`${threadUpdatedAtExpression} >= ?`);
       threadParams.push(options.sinceEpochMs);
@@ -288,10 +320,7 @@ export function searchThreads(
       messageWhere.push("t.model_provider = ?");
       messageParams.push(options.provider);
     }
-    if (options.cwd) {
-      messageWhere.push("t.cwd = ?");
-      messageParams.push(options.cwd);
-    }
+    appendQueryScopeClauses(messageWhere, messageParams, options, "t.cwd");
     if (typeof options.sinceEpochMs === "number") {
       messageWhere.push(`${joinedUpdatedAtExpression} >= ?`);
       messageParams.push(options.sinceEpochMs);
@@ -525,6 +554,197 @@ export function getThreadStats(paths: ResolvedPaths): Effect.Effect<Record<strin
       topCwds,
       meta: Object.fromEntries(meta.map((row) => [row.key, row.value])),
     };
+    }),
+  );
+}
+
+export function getObservedPaths(
+  paths: ResolvedPaths,
+  options: {
+    match?: string;
+    limit: number;
+  },
+): Effect.Effect<Record<string, unknown>, CliFailure> {
+  return withDatabase(paths.indexDb, (db) =>
+    Effect.gen(function* () {
+      const where = ["cwd IS NOT NULL", "cwd != ''"];
+      const params: Array<string | number> = [];
+
+      if (options.match) {
+        where.push(
+          `(${containsTextExpression("cwd")} OR ${containsTextExpression("COALESCE(git_branch, '')")} OR ${containsTextExpression("COALESCE(git_origin_url, '')")})`,
+        );
+        params.push(
+          options.match,
+          options.match,
+          options.match,
+          options.match,
+          options.match,
+          options.match,
+        );
+      }
+
+      params.push(options.limit);
+      const rows = yield* all<Record<string, unknown>>(
+        db,
+        `
+            SELECT
+              cwd,
+              COUNT(*) AS thread_count,
+              MAX(${normalizedEpochExpression("updated_at")}) AS last_updated_at,
+              MAX(NULLIF(git_branch, '')) AS sample_branch,
+              MAX(NULLIF(git_origin_url, '')) AS sample_origin
+            FROM threads
+            WHERE ${where.join(" AND ")}
+            GROUP BY cwd
+            ORDER BY last_updated_at DESC NULLS LAST, thread_count DESC, cwd ASC
+            LIMIT ?
+          `,
+        ...params,
+      );
+
+      const derivedRows = rows.map((row) => {
+        const cwd = firstString(row.cwd) ?? "";
+        const derived = derivePathScopes(cwd);
+        return {
+          cwd,
+          observed_path_kind: derived.pathKind,
+          observed_repo_scope: derived.repoScope,
+          observed_worktree_scope: derived.worktreeScope,
+          thread_count: Number(row.thread_count ?? 0),
+          last_updated_at: Number(row.last_updated_at ?? 0),
+          sample_branch: firstString(row.sample_branch),
+          sample_origin: firstString(row.sample_origin),
+        };
+      });
+
+      const liveRows = yield* Effect.forEach(
+        derivedRows,
+        (row) =>
+          resolveLiveGitScope(row.cwd).pipe(
+            Effect.map((live) => ({
+              ...row,
+              path_exists: live.pathExists,
+              resolved_path: live.resolvedPath,
+              live_verified: live.liveVerified,
+              live_status: live.liveStatus,
+              live_repo_scope: live.liveRepoScope,
+              live_worktree_scope: live.liveWorktreeScope,
+              live_error: live.liveError,
+            })),
+          ),
+        { concurrency: 8 },
+      );
+
+      const knownRepoScopes = new Set(
+        liveRows
+          .flatMap((row) => [row.live_repo_scope, row.observed_repo_scope])
+          .filter((value): value is string => value !== null),
+      );
+
+      const originToRepoScopes = new Map<string, Set<string>>();
+      for (const row of liveRows) {
+        if (!row.sample_origin) {
+          continue;
+        }
+        const scopes = originToRepoScopes.get(row.sample_origin) ?? new Set<string>();
+        if (row.live_repo_scope) {
+          scopes.add(row.live_repo_scope);
+        }
+        if (row.observed_repo_scope) {
+          scopes.add(row.observed_repo_scope);
+        }
+        if (scopes.size > 0) {
+          originToRepoScopes.set(row.sample_origin, scopes);
+        }
+      }
+
+      const results = liveRows.map((row) => {
+        const liveRepoScope = aliasScopePath(row.cwd, row.resolved_path, row.live_repo_scope);
+        const liveWorktreeScope = aliasScopePath(row.cwd, row.resolved_path, row.live_worktree_scope);
+        let repoScope = liveRepoScope ?? row.observed_repo_scope;
+        let worktreeScope = liveWorktreeScope ?? row.observed_worktree_scope;
+        let pathKind: "cwd" | "repo" | "worktree" = row.observed_path_kind;
+
+        if (!repoScope) {
+          const matchedRepoScope =
+            Array.from(knownRepoScopes).find((candidate) => startsWithScope(row.cwd, candidate)) ?? null;
+          if (matchedRepoScope) {
+            repoScope = matchedRepoScope;
+          }
+        }
+
+        if (!repoScope && row.sample_origin) {
+          const scopes = originToRepoScopes.get(row.sample_origin);
+          if (scopes?.size === 1) {
+            const [singleScope] = Array.from(scopes);
+            if (startsWithScope(row.cwd, singleScope)) {
+              repoScope = singleScope;
+            }
+          }
+        }
+
+        const canonicalScopedWorktree =
+          row.live_worktree_scope && row.live_repo_scope && row.live_worktree_scope !== row.live_repo_scope
+            ? row.live_worktree_scope
+            : !row.live_verified
+              ? worktreeScope
+              : null;
+
+        if (canonicalScopedWorktree && startsWithScope(row.resolved_path ?? row.cwd, canonicalScopedWorktree)) {
+          pathKind = "worktree";
+        } else if (repoScope && row.cwd === repoScope) {
+          pathKind = "repo";
+        } else if (!repoScope && row.observed_path_kind === "worktree" && row.observed_worktree_scope) {
+          pathKind = "worktree";
+          worktreeScope = row.observed_worktree_scope;
+          repoScope = row.observed_repo_scope;
+        } else {
+          pathKind = "cwd";
+        }
+
+        const recommendedScope =
+          worktreeScope && canonicalScopedWorktree
+            ? {
+                kind: "worktree",
+                flag: "--worktree",
+                value: worktreeScope,
+              }
+            : repoScope
+              ? {
+                  kind: "repo",
+                  flag: "--repo",
+                  value: repoScope,
+                }
+              : {
+                  kind: "cwd",
+                  flag: "--cwd",
+                  value: row.cwd,
+                };
+
+        return {
+          cwd: row.cwd,
+          path_kind: pathKind,
+          repo_scope: repoScope,
+          worktree_scope: worktreeScope,
+          path_exists: row.path_exists,
+          live_status: row.live_status,
+          live_repo_scope: liveRepoScope,
+          live_worktree_scope: liveWorktreeScope,
+          live_error: row.live_error,
+          recommended_scope: recommendedScope,
+          thread_count: row.thread_count,
+          last_updated_at: row.last_updated_at > 0 ? new Date(row.last_updated_at).toISOString() : null,
+          sample_branch: row.sample_branch,
+          sample_origin: row.sample_origin,
+        };
+      });
+
+      return {
+        subject: "paths",
+        match: options.match ?? null,
+        results,
+      };
     }),
   );
 }

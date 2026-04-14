@@ -17,6 +17,40 @@ if (cliWarmup.status !== 0) {
   throw new Error(`CLI warmup failed: ${cliWarmup.stderr}`);
 }
 
+function runGit(args: string[], cwd?: string): string {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
+function makeLiveGitRepoFixture() {
+  const root = mkdtempSync(join(tmpdir(), "agent-threads-git-scope-"));
+  const repoRoot = join(root, "scoped-project");
+  mkdirSync(join(repoRoot, "packages", "app"), { recursive: true });
+  writeFileSync(join(repoRoot, "README.md"), "scoped project\n", "utf8");
+
+  runGit(["init", repoRoot]);
+  runGit(["config", "user.name", "Test User"], repoRoot);
+  runGit(["config", "user.email", "test@example.com"], repoRoot);
+  runGit(["add", "."], repoRoot);
+  runGit(["commit", "-m", "init"], repoRoot);
+
+  const worktreeRoot = `${repoRoot}.worktrees/feat-a`;
+  runGit(["worktree", "add", "-b", "feat-a", worktreeRoot], repoRoot);
+  mkdirSync(join(worktreeRoot, "apps", "web"), { recursive: true });
+  writeFileSync(join(worktreeRoot, "apps", "web", "feature.txt"), "feat\n", "utf8");
+
+  return {
+    repoRoot,
+    worktreeRoot,
+  };
+}
+
 function createEmptyThreadsTable(dbPath: string): void {
   const db = new Database(dbPath);
   try {
@@ -531,6 +565,68 @@ function updateStateThread(dbPath: string, threadId: string, patch: { title?: st
   }
 }
 
+function insertStateThread(input: {
+  dbPath: string;
+  threadId: string;
+  rolloutPath: string;
+  cwd: string;
+  title: string;
+  updatedAt: number;
+  createdAt?: number;
+  provider?: string;
+  source?: string;
+  gitBranch?: string;
+  gitOriginUrl?: string;
+  firstUserMessage?: string;
+}) {
+  const db = new Database(input.dbPath);
+  try {
+    db.query(`
+      INSERT INTO threads (
+        id,
+        rollout_path,
+        created_at,
+        updated_at,
+        source,
+        model_provider,
+        cwd,
+        title,
+        sandbox_policy,
+        approval_mode,
+        tokens_used,
+        archived,
+        cli_version,
+        first_user_message,
+        git_branch,
+        git_origin_url,
+        model,
+        reasoning_effort
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.threadId,
+      input.rolloutPath,
+      input.createdAt ?? input.updatedAt,
+      input.updatedAt,
+      input.source ?? "cli",
+      input.provider ?? "Spencer",
+      input.cwd,
+      input.title,
+      "workspace-write",
+      "on-request",
+      0,
+      0,
+      "0.119.0",
+      input.firstUserMessage ?? "",
+      input.gitBranch ?? "",
+      input.gitOriginUrl ?? "",
+      "gpt-5.4",
+      "high",
+    );
+  } finally {
+    db.close();
+  }
+}
+
 function readIndexedThread(indexDb: string, threadId: string) {
   const db = new Database(indexDb, { readonly: true });
   try {
@@ -615,6 +711,388 @@ test("inspect source reports offline local state without auth", () => {
   expect(payload.data.authRequired).toBe(false);
   expect(payload.data.stateDbExists).toBe(true);
   expect(payload.data.sessionFileCount).toBe(1);
+});
+
+test("inspect paths groups observed cwd values and derives repo/worktree scopes", () => {
+  const repoRoot = "/tmp/scoped-project";
+  const worktreeRoot = "/tmp/scoped-project.worktrees/feat-a";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T05:00:00.000Z", role: "user", text: "alpha" }],
+      }),
+    },
+    {
+      fileName: "rollout-main-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-subdir",
+        title: "Main subdir",
+        cwd: `${repoRoot}/packages/app`,
+        messages: [{ timestamp: "2026-04-11T04:00:00.000Z", role: "user", text: "beta" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-root-1.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root-1",
+        title: "Worktree root 1",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "gamma" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-root-2.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root-2",
+        title: "Worktree root 2",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "delta" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-subdir",
+        title: "Worktree subdir",
+        cwd: `${worktreeRoot}/apps/web`,
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "epsilon" }],
+      }),
+    },
+    {
+      fileName: "rollout-other.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "other-project",
+        title: "Other project",
+        cwd: "/tmp/other-project",
+        messages: [{ timestamp: "2026-04-11T00:00:00.000Z", role: "user", text: "zeta" }],
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-root.jsonl"),
+    cwd: repoRoot,
+    title: "Main root",
+    updatedAt: 1_744_350_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-subdir.jsonl"),
+    cwd: `${repoRoot}/packages/app`,
+    title: "Main subdir",
+    updatedAt: 1_744_349_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-root-1",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-root-1.jsonl"),
+    cwd: worktreeRoot,
+    title: "Worktree root 1",
+    updatedAt: 1_744_348_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-root-2",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-root-2.jsonl"),
+    cwd: worktreeRoot,
+    title: "Worktree root 2",
+    updatedAt: 1_744_347_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-subdir.jsonl"),
+    cwd: `${worktreeRoot}/apps/web`,
+    title: "Worktree subdir",
+    updatedAt: 1_744_346_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "other-project",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-other.jsonl"),
+    cwd: "/tmp/other-project",
+    title: "Other project",
+    updatedAt: 1_744_345_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/other-project.git",
+  });
+
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const result = runCli(["--json", "--refresh", "inspect", "paths", "--limit", "10"], sourceRoot, indexDb);
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: {
+      subject: string;
+      results: Array<Record<string, unknown>>;
+    };
+  };
+  expect(payload.data.subject).toBe("paths");
+
+  const byCwd = new Map(payload.data.results.map((row) => [String(row.cwd), row]));
+  expect(byCwd.get(repoRoot)?.path_kind).toBe("repo");
+  expect(byCwd.get(repoRoot)?.live_status).toBe("missing");
+  expect(byCwd.get(repoRoot)?.repo_scope).toBe(repoRoot);
+  expect((byCwd.get(repoRoot)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--repo");
+
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.path_kind).toBe("cwd");
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.live_status).toBe("missing");
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.repo_scope).toBe(repoRoot);
+  expect((byCwd.get(`${repoRoot}/packages/app`)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--repo");
+
+  expect(byCwd.get(worktreeRoot)?.path_kind).toBe("worktree");
+  expect(byCwd.get(worktreeRoot)?.live_status).toBe("missing");
+  expect(byCwd.get(worktreeRoot)?.repo_scope).toBe(repoRoot);
+  expect(byCwd.get(worktreeRoot)?.worktree_scope).toBe(worktreeRoot);
+  expect(byCwd.get(worktreeRoot)?.thread_count).toBe(2);
+  expect((byCwd.get(worktreeRoot)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--worktree");
+
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.path_kind).toBe("worktree");
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.live_status).toBe("missing");
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.worktree_scope).toBe(worktreeRoot);
+
+  expect(byCwd.get("/tmp/other-project")?.path_kind).toBe("cwd");
+  expect(byCwd.get("/tmp/other-project")?.live_status).toBe("missing");
+  expect((byCwd.get("/tmp/other-project")?.recommended_scope as Record<string, unknown>)?.flag).toBe("--cwd");
+});
+
+test("inspect paths verifies live git repo and worktree scopes when paths exist", () => {
+  const { repoRoot, worktreeRoot } = makeLiveGitRepoFixture();
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T05:00:00.000Z", role: "user", text: "alpha" }],
+      }),
+    },
+    {
+      fileName: "rollout-main-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-subdir",
+        title: "Main subdir",
+        cwd: `${repoRoot}/packages/app`,
+        messages: [{ timestamp: "2026-04-11T04:00:00.000Z", role: "user", text: "beta" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root",
+        title: "Worktree root",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "gamma" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-subdir",
+        title: "Worktree subdir",
+        cwd: `${worktreeRoot}/apps/web`,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "delta" }],
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-root.jsonl"),
+    cwd: repoRoot,
+    title: "Main root",
+    updatedAt: 1_744_350_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-subdir.jsonl"),
+    cwd: `${repoRoot}/packages/app`,
+    title: "Main subdir",
+    updatedAt: 1_744_349_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-root.jsonl"),
+    cwd: worktreeRoot,
+    title: "Worktree root",
+    updatedAt: 1_744_348_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-subdir.jsonl"),
+    cwd: `${worktreeRoot}/apps/web`,
+    title: "Worktree subdir",
+    updatedAt: 1_744_347_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const result = runCli(["--json", "--refresh", "inspect", "paths", "--limit", "10"], sourceRoot, indexDb);
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+
+  const byCwd = new Map(payload.data.results.map((row) => [String(row.cwd), row]));
+  expect(byCwd.get(repoRoot)?.live_status).toBe("verified");
+  expect(byCwd.get(repoRoot)?.path_kind).toBe("repo");
+  expect(byCwd.get(repoRoot)?.live_repo_scope).toBe(repoRoot);
+  expect(byCwd.get(repoRoot)?.live_worktree_scope).toBe(repoRoot);
+  expect((byCwd.get(repoRoot)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--repo");
+
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.live_status).toBe("verified");
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.path_kind).toBe("cwd");
+  expect(byCwd.get(`${repoRoot}/packages/app`)?.repo_scope).toBe(repoRoot);
+  expect((byCwd.get(`${repoRoot}/packages/app`)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--repo");
+
+  expect(byCwd.get(worktreeRoot)?.live_status).toBe("verified");
+  expect(byCwd.get(worktreeRoot)?.path_kind).toBe("worktree");
+  expect(byCwd.get(worktreeRoot)?.live_repo_scope).toBe(repoRoot);
+  expect(byCwd.get(worktreeRoot)?.live_worktree_scope).toBe(worktreeRoot);
+  expect((byCwd.get(worktreeRoot)?.recommended_scope as Record<string, unknown>)?.flag).toBe("--worktree");
+
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.live_status).toBe("verified");
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.path_kind).toBe("worktree");
+  expect(byCwd.get(`${worktreeRoot}/apps/web`)?.worktree_scope).toBe(worktreeRoot);
+});
+
+test("inspect paths supports match filtering and compact human output", () => {
+  const worktreeRoot = "/tmp/scoped-project.worktrees/feat-a";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-worktree.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root",
+        title: "Worktree root",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-other.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "other-project",
+        title: "Other project",
+        cwd: "/tmp/other-project",
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "needle" }],
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree.jsonl"),
+    cwd: worktreeRoot,
+    title: "Worktree root",
+    updatedAt: 1_744_348_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "other-project",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-other.jsonl"),
+    cwd: "/tmp/other-project",
+    title: "Other project",
+    updatedAt: 1_744_345_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/other-project.git",
+  });
+
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const jsonResult = runCli(
+    ["--json", "--refresh", "inspect", "paths", "--match", "scoped-project.git", "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(jsonResult.status).toBe(0);
+  const jsonPayload = JSON.parse(jsonResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(jsonPayload.data.results).toHaveLength(1);
+  expect(jsonPayload.data.results[0]?.cwd).toBe(worktreeRoot);
+
+  const humanResult = runCli(
+    ["--refresh", "inspect", "paths", "--match", "feat-a", "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(humanResult.status).toBe(0);
+  expect(humanResult.stdout).toContain(`[worktree] ${worktreeRoot}`);
+  expect(humanResult.stdout).toContain(`scope: --worktree ${worktreeRoot}`);
+});
+
+test("inspect paths marks existing non-git directories as not_git", () => {
+  const nonGitDir = mkdtempSync(join(tmpdir(), "agent-threads-non-git-"));
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-non-git.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "non-git",
+        title: "Non git path",
+        cwd: nonGitDir,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "needle" }],
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "non-git",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-non-git.jsonl"),
+    cwd: nonGitDir,
+    title: "Non git path",
+    updatedAt: 1_744_348_000_000,
+    gitOriginUrl: "https://example.com/non-git.git",
+  });
+
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+  const result = runCli(["--json", "--refresh", "inspect", "paths", "--limit", "10"], sourceRoot, indexDb);
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(payload.data.results[0]?.cwd).toBe(nonGitDir);
+  expect(payload.data.results[0]?.path_exists).toBe(true);
+  expect(payload.data.results[0]?.live_status).toBe("not_git");
+  expect((payload.data.results[0]?.recommended_scope as Record<string, unknown>)?.flag).toBe("--cwd");
 });
 
 test("find and open work against rebuilt local index", () => {
@@ -1454,6 +1932,232 @@ test("find --kind message applies provider filtering before the limit", () => {
   expect(payload.data.results).toHaveLength(1);
   expect(payload.data.results[0]?.thread_id).toBe("target-thread");
   expect(payload.data.results[0]?.provider).toBe("Spencer");
+});
+
+test("find --kind thread supports repo-scoped filtering across repo and worktrees", () => {
+  const repoRoot = "/tmp/scoped-project";
+  const worktreeRoot = "/tmp/scoped-project.worktrees/feat-a";
+  const siblingWorktreeRoot = "/tmp/scoped-project.worktrees/fix-b";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Needle main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T05:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-main-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-subdir",
+        title: "Needle main subdir",
+        cwd: `${repoRoot}/packages/app`,
+        messages: [{ timestamp: "2026-04-11T04:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root",
+        title: "Needle worktree root",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-subdir",
+        title: "Needle worktree subdir",
+        cwd: `${worktreeRoot}/apps/web`,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-sibling-worktree.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "sibling-worktree",
+        title: "Needle sibling worktree",
+        cwd: siblingWorktreeRoot,
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-other.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "other-project",
+        title: "Needle other project",
+        cwd: "/tmp/other-project",
+        messages: [{ timestamp: "2026-04-11T00:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    ["--json", "--refresh", "find", "needle", "--kind", "thread", "--repo", repoRoot, "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<{ thread_id: string }> };
+  };
+  expect(payload.data.results.map((row) => row.thread_id).sort()).toEqual([
+    "main-root",
+    "main-subdir",
+    "sibling-worktree",
+    "worktree-root",
+    "worktree-subdir",
+  ]);
+});
+
+test("find --kind message supports worktree-scoped filtering", () => {
+  const repoRoot = "/tmp/scoped-project";
+  const targetWorktreeRoot = "/tmp/scoped-project.worktrees/feat-a";
+  const siblingWorktreeRoot = "/tmp/scoped-project.worktrees/fix-b";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-target-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "target-root",
+        title: "Target worktree root",
+        cwd: targetWorktreeRoot,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-target-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "target-subdir",
+        title: "Target worktree subdir",
+        cwd: `${targetWorktreeRoot}/packages/app`,
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-sibling.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "sibling-worktree",
+        title: "Sibling worktree",
+        cwd: siblingWorktreeRoot,
+        messages: [{ timestamp: "2026-04-11T00:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    [
+      "--json",
+      "--refresh",
+      "find",
+      "shared scope needle",
+      "--kind",
+      "message",
+      "--worktree",
+      targetWorktreeRoot,
+      "--limit",
+      "10",
+    ],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<{ thread_id: string }> };
+  };
+  expect(payload.data.results.map((row) => row.thread_id).sort()).toEqual(["target-root", "target-subdir"]);
+});
+
+test("recent supports repo-scoped filtering across repo and worktrees", () => {
+  const repoRoot = "/tmp/scoped-project";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root",
+        title: "Worktree root",
+        cwd: "/tmp/scoped-project.worktrees/feat-a",
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+    {
+      fileName: "rollout-other.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "other-project",
+        title: "Other project",
+        cwd: "/tmp/other-project",
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "shared scope needle" }],
+      }),
+    },
+  ]);
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    ["--json", "--refresh", "recent", "--repo", repoRoot, "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { results: Array<{ thread_id: string }> };
+  };
+  expect(payload.data.results.map((row) => row.thread_id).sort()).toEqual(["main-root", "worktree-root"]);
+});
+
+test("repo and worktree scope options are mutually exclusive", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    [
+      "--json",
+      "--refresh",
+      "find",
+      "notify_url",
+      "--repo",
+      "/tmp/scoped-project",
+      "--worktree",
+      "/tmp/scoped-project.worktrees/feat-a",
+    ],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(1);
+  const payload = JSON.parse(result.stdout) as {
+    ok: false;
+    error: { code: string; message: string };
+  };
+  expect(payload.error.code).toBe("invalid-argument");
+  expect(payload.error.message).toBe("Use only one of --cwd, --repo, or --worktree.");
 });
 
 test("find supports absolute time filters", () => {

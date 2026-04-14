@@ -36,10 +36,51 @@ make install-local
 
 ## Workflow
 
-1. Discover: `ath --json find "query"` or `ath --json recent --limit 20`
-2. Open: `ath --json open <thread-id>`
-3. Zoom in: `ath --json open <thread-id>:12 --before 2 --after 3`
-4. Export if needed: `ath --json export <thread-id> --format md --out /tmp/thread.md`
+1. Scope first: determine which repo or worktree the user question belongs to before querying history.
+2. Inspect observed session paths: `ath --json inspect paths`
+3. Discover: use scoped `ath --json find ...` or `ath --json recent ...`
+4. Open: `ath --json open <thread-id>`
+5. Zoom in: `ath --json open <thread-id>:12 --before 2 --after 3`
+6. Export if needed: `ath --json export <thread-id> --format md --out /tmp/thread.md`
+
+### Scope First
+
+Prefer narrowing the search before calling `ath`.
+
+Typical order:
+
+1. Infer the likely repo/worktree from the current task, current cwd, user wording, branch name, or file paths already in context.
+2. Ask `ath` which paths already have history:
+
+```bash
+ath --json inspect paths
+ath --json inspect paths --match mercpay
+```
+
+3. Prefer the returned `recommended_scope`, `repo_scope`, `worktree_scope`, and `live_status` fields.
+4. If the current directory is inside a Git repo and the `inspect paths` result is still ambiguous, use Git to resolve scope:
+
+```bash
+git rev-parse --show-toplevel
+git worktree list --porcelain
+```
+
+5. Pick exactly one scope:
+- `--worktree /path/to/repo.worktrees/feat-x` for branch- or worktree-specific questions.
+- `--repo /path/to/repo` for whole-project history across the main repo and its sibling `.worktrees/*`.
+- `--cwd /path/to/dir` only when the question is truly about one exact working directory.
+6. Only fall back to broad unscoped `ath find` or `ath recent` when you cannot infer a plausible scope.
+
+Examples:
+
+```bash
+ath --json inspect paths --match mercpay
+ath --json find "retry strategy" --repo /Users/me/src/mercpay
+ath --json find "payment callback" --worktree /Users/me/src/mercpay.worktrees/feat-refactor
+ath --json recent --repo /Users/me/src/mercpay --limit 20
+```
+
+If the current repo is unclear but Codex-managed worktrees may be relevant, inspecting `~/.codex/worktrees` can provide additional hints. Treat that as a convenience source, not a canonical global registry.
 
 Use `--kind message` on `find` when the query is textual:
 
@@ -66,6 +107,9 @@ Only use read-only `SELECT` or `WITH` SQL.
 ## Rules
 
 - Prefer `--json`; use `--json-pretty` only for human debugging.
+- Prefer `inspect paths` before project-scoped history search.
+- Prefer repo/worktree-scoped queries over global queries.
+- Determine the most likely repo/worktree before calling `ath` when the user question is project-specific.
 - Prefer `find`/`recent` before `inspect` or `admin sql`.
 - Prefer local context `open <thread-id>:<seq>` before full transcripts.
 - Do not modify source files with this tool.

@@ -18,21 +18,30 @@ export interface ExportActionOptions {
   out?: string;
 }
 
+export interface InspectActionOptions {
+  match?: string;
+  limit: number;
+}
+
 export type FindKind = "all" | "thread" | "message";
 
-export interface FindActionOptions {
+export interface QueryScopeOptions {
+  cwd?: string;
+  repo?: string;
+  worktree?: string;
+}
+
+export interface FindActionOptions extends QueryScopeOptions {
   kind: FindKind;
   provider?: string;
-  cwd?: string;
   role?: string;
   limit: number;
   since?: string;
   until?: string;
 }
 
-export interface RecentActionOptions {
+export interface RecentActionOptions extends QueryScopeOptions {
   provider?: string;
-  cwd?: string;
   limit: number;
   since?: string;
   until?: string;

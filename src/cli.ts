@@ -11,10 +11,12 @@ import {
 } from "./handlers.ts";
 import { emitEffectResult } from "./output.ts";
 import { CliFailure } from "./errors.ts";
+import { normalizeQueryScope } from "./query-scope.ts";
 import type {
   ExportActionOptions,
   FindActionOptions,
   GlobalOptions,
+  InspectActionOptions,
   OpenActionOptions,
   RecentActionOptions,
 } from "./types.ts";
@@ -80,16 +82,23 @@ function toFindActionOptions(input: {
   kind: FindActionOptions["kind"];
   provider: Option.Option<string>;
   cwd: Option.Option<string>;
+  repo: Option.Option<string>;
+  worktree: Option.Option<string>;
   role: Option.Option<string>;
   limit: number;
   since: Option.Option<string>;
   until: Option.Option<string>;
 }): Effect.Effect<FindActionOptions, CliFailure> {
   return Effect.gen(function* () {
+    const scope = yield* normalizeQueryScope({
+      cwd: Option.getOrUndefined(input.cwd),
+      repo: Option.getOrUndefined(input.repo),
+      worktree: Option.getOrUndefined(input.worktree),
+    });
     return {
       kind: input.kind,
       provider: Option.getOrUndefined(input.provider),
-      cwd: Option.getOrUndefined(input.cwd),
+      ...scope,
       role: Option.getOrUndefined(input.role),
       limit: yield* validateIntegerOption(input.limit, "--limit", (value) => value > 0),
       since: Option.getOrUndefined(input.since),
@@ -101,14 +110,21 @@ function toFindActionOptions(input: {
 function toRecentActionOptions(input: {
   provider: Option.Option<string>;
   cwd: Option.Option<string>;
+  repo: Option.Option<string>;
+  worktree: Option.Option<string>;
   limit: number;
   since: Option.Option<string>;
   until: Option.Option<string>;
 }): Effect.Effect<RecentActionOptions, CliFailure> {
   return Effect.gen(function* () {
+    const scope = yield* normalizeQueryScope({
+      cwd: Option.getOrUndefined(input.cwd),
+      repo: Option.getOrUndefined(input.repo),
+      worktree: Option.getOrUndefined(input.worktree),
+    });
     return {
       provider: Option.getOrUndefined(input.provider),
-      cwd: Option.getOrUndefined(input.cwd),
+      ...scope,
       limit: yield* validateIntegerOption(input.limit, "--limit", (value) => value > 0),
       since: Option.getOrUndefined(input.since),
       until: Option.getOrUndefined(input.until),
@@ -132,6 +148,18 @@ function toOpenActionOptions(input: {
   });
 }
 
+function toInspectActionOptions(input: {
+  match: Option.Option<string>;
+  limit: number;
+}): Effect.Effect<InspectActionOptions, CliFailure> {
+  return Effect.gen(function* () {
+    return {
+      match: Option.getOrUndefined(input.match),
+      limit: yield* validateIntegerOption(input.limit, "--limit", (value) => value > 0),
+    };
+  });
+}
+
 const findCommand = Command.make(
   "find",
   {
@@ -140,6 +168,8 @@ const findCommand = Command.make(
     kind: Options.choice("kind", ["all", "thread", "message"]).pipe(Options.withDefault("all")),
     provider: Options.optional(Options.text("provider")),
     cwd: Options.optional(Options.text("cwd")),
+    repo: Options.optional(Options.text("repo")),
+    worktree: Options.optional(Options.text("worktree")),
     role: Options.optional(Options.text("role")),
     limit: Options.integer("limit").pipe(Options.withDefault(20)),
     since: Options.optional(Options.text("since")),
@@ -164,6 +194,8 @@ const recentCommand = Command.make(
     ...globalOptionsConfig,
     provider: Options.optional(Options.text("provider")),
     cwd: Options.optional(Options.text("cwd")),
+    repo: Options.optional(Options.text("repo")),
+    worktree: Options.optional(Options.text("worktree")),
     limit: Options.integer("limit").pipe(Options.withDefault(20)),
     since: Options.optional(Options.text("since")),
     until: Options.optional(Options.text("until")),
@@ -211,10 +243,25 @@ const inspectCommand = Command.make(
     subject: Args.text({ name: "subject" }),
     value: Args.optional(Args.text({ name: "value" })),
     related: Options.boolean("related"),
+    match: Options.optional(Options.text("match")),
+    limit: Options.integer("limit").pipe(Options.withDefault(50)),
   },
   (input) => {
     const options = toGlobalOptions(input);
-    return emitEffectResult("inspect", options, handleInspect(input.subject, Option.getOrUndefined(input.value), input.related, options));
+    return emitEffectResult(
+      "inspect",
+      options,
+      Effect.gen(function* () {
+        const actionOptions = yield* toInspectActionOptions(input);
+        return yield* handleInspect(
+          input.subject,
+          Option.getOrUndefined(input.value),
+          input.related,
+          actionOptions,
+          options,
+        );
+      }),
+    );
   },
 );
 

@@ -1,9 +1,10 @@
 import { Effect } from "effect";
 
 import { all, get, withDatabase } from "./infra/sqlite.ts";
+import { appendQueryScopeClauses } from "./query-scope.ts";
 import { buildSnippet, isNoisyText } from "./threads.ts";
 import type { CliFailure } from "./errors.ts";
-import type { ResolvedPaths } from "./types.ts";
+import type { QueryScopeOptions, ResolvedPaths } from "./types.ts";
 
 function containsTextExpression(columnName: string): string {
   return `(instr(${columnName}, ?) > 0 OR instr(lower(${columnName}), lower(?)) > 0)`;
@@ -38,11 +39,10 @@ function toFtsMatchQuery(query: string): string {
 
 function searchMessagesByContains(
   paths: ResolvedPaths,
-  options: {
+  options: QueryScopeOptions & {
     query: string;
     threadId?: string;
     provider?: string;
-    cwd?: string;
     role?: string;
     limit: number;
     sinceIso?: string;
@@ -61,10 +61,7 @@ function searchMessagesByContains(
         where.push("t.model_provider = ?");
         params.push(options.provider);
       }
-      if (options.cwd) {
-        where.push("t.cwd = ?");
-        params.push(options.cwd);
-      }
+      appendQueryScopeClauses(where, params, options, "t.cwd");
       if (options.role) {
         where.push("m.role = ?");
         params.push(options.role);
@@ -137,11 +134,10 @@ function searchMessagesByContains(
 
 function searchMessagesByFts(
   paths: ResolvedPaths,
-  options: {
+  options: QueryScopeOptions & {
     query: string;
     threadId?: string;
     provider?: string;
-    cwd?: string;
     role?: string;
     limit: number;
     sinceIso?: string;
@@ -160,10 +156,7 @@ function searchMessagesByFts(
         where.push("t.model_provider = ?");
         params.push(options.provider);
       }
-      if (options.cwd) {
-        where.push("t.cwd = ?");
-        params.push(options.cwd);
-      }
+      appendQueryScopeClauses(where, params, options, "t.cwd");
       if (options.role) {
         where.push("m.role = ?");
         params.push(options.role);
@@ -244,11 +237,10 @@ function searchMessagesByFts(
 
 export function searchMessages(
   paths: ResolvedPaths,
-  options: {
+  options: QueryScopeOptions & {
     query: string;
     threadId?: string;
     provider?: string;
-    cwd?: string;
     role?: string;
     limit: number;
     sinceIso?: string;

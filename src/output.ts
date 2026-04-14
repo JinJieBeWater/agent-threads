@@ -4,6 +4,7 @@ import {
   renderDoctor,
   renderFindResults,
   renderMessageList,
+  renderObservedPaths,
   renderRecentResults,
   renderStats,
   renderThreadDetail,
@@ -64,6 +65,10 @@ export function printHuman(group: string, data: unknown): void {
     }
     if (record.thread && record.related) {
       process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
+      return;
+    }
+    if (record.subject === "paths" && Array.isArray(record.results)) {
+      process.stdout.write(`${renderObservedPaths(record.results as Array<Record<string, unknown>>)}\n`);
       return;
     }
   }
