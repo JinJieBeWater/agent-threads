@@ -55,6 +55,7 @@ Typical order:
 ```bash
 ath --json inspect paths
 ath --json inspect paths --match mercpay
+ath --json inspect paths --repo /Users/me/src/mercpay
 ```
 
 3. Prefer the returned `recommended_scope`, `repo_scope`, `worktree_scope`, and `live_status` fields.
@@ -65,19 +66,34 @@ git rev-parse --show-toplevel
 git worktree list --porcelain
 ```
 
-5. Pick exactly one scope:
+5. Pick exactly one query scope for `find` or `recent`:
 - `--worktree /path/to/repo.worktrees/feat-x` for branch- or worktree-specific questions.
 - `--repo /path/to/repo` for whole-project history across the main repo and its sibling `.worktrees/*`.
 - `--cwd /path/to/dir` only when the question is truly about one exact working directory.
+These scope flags can also narrow `inspect paths` itself, but there they only filter path rows; they do not change how `inspect` searches messages or threads.
 6. Only fall back to broad unscoped `ath find` or `ath recent` when you cannot infer a plausible scope.
+
+Common mistake:
+
+- Do not use `ath --json inspect paths --repo /repo` expecting repo-scoped message search.
+- `inspect paths` only returns path rows.
+- Use `find` or `recent` after you choose the scope.
 
 Examples:
 
 ```bash
 ath --json inspect paths --match mercpay
+ath --json inspect paths --repo /Users/me/src/mercpay
 ath --json find "retry strategy" --repo /Users/me/src/mercpay
 ath --json find "payment callback" --worktree /Users/me/src/mercpay.worktrees/feat-refactor
 ath --json recent --repo /Users/me/src/mercpay --limit 20
+```
+
+Preferred two-step pattern:
+
+```bash
+ath --json inspect paths --match mercpay
+ath --json find "payment callback" --repo /Users/me/src/mercpay --kind message
 ```
 
 If the current repo is unclear but Codex-managed worktrees may be relevant, inspecting `~/.codex/worktrees` can provide additional hints. Treat that as a convenience source, not a canonical global registry.

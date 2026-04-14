@@ -41,7 +41,7 @@ export function renderCliHome(input: {
     ["find <query>", "Search threads and messages"],
     ["recent", "List recently updated threads"],
     ["open <target>", "Open a thread or message context"],
-    ["inspect <subject>", "Inspect source or index state"],
+    ["inspect <subcommand>", "Inspect source, index, thread, or paths"],
     ["export <thread-id>", "Export one thread as md or json"],
     ["admin <action>", "Maintenance and read-only SQL"],
   ] as const;
@@ -54,8 +54,9 @@ export function renderCliHome(input: {
     "",
     "Quickstart",
     `  ${name} inspect source`,
-    `  ${name} find "error handling"`,
-    `  ${name} recent --limit 10`,
+    `  ${name} inspect paths --match mercpay`,
+    `  ${name} find "error handling" --repo /path/to/repo`,
+    `  ${name} recent --repo /path/to/repo --limit 10`,
     `  ${name} open <thread-id>:12 --before 2 --after 2`,
     "",
     "Commands",
@@ -64,6 +65,147 @@ export function renderCliHome(input: {
     "Help",
     `  ${name} --help`,
     `  ${name} <command> --help`,
+  ].join("\n");
+}
+
+export function renderInspectHome(input: {
+  name: string;
+}): string {
+  const { name } = input;
+  const commands = [
+    ["source", "Inspect configured source metadata and storage paths"],
+    ["index", "Inspect index stats and provider/cwd summaries"],
+    ["thread <thread-id>", "Inspect one thread and optional related threads"],
+    ["paths", "Inspect observed paths and recommended query scopes"],
+  ] as const;
+  const commandWidth = Math.max(...commands.map(([usage]) => usage.length));
+
+  return [
+    "inspect",
+    "",
+    "Inspect source state, index state, one thread, or observed path scopes.",
+    "",
+    "Subcommands",
+    ...commands.map(([usage, description]) => `  ${usage.padEnd(commandWidth)}  ${description}`),
+    "",
+    "Examples",
+    `  ${name} inspect source`,
+    `  ${name} inspect index`,
+    `  ${name} inspect paths --match mercpay`,
+    `  ${name} inspect thread <thread-id> --related`,
+    "",
+    "Help",
+    `  ${name} inspect <subcommand> --help`,
+    `  ${name} inspect paths --help`,
+  ].join("\n");
+}
+
+export type InspectHelpSubject = "source" | "index" | "thread" | "paths";
+
+const inspectGlobalOptions = [
+  "--json",
+  "--json-pretty",
+  "--refresh",
+  "--source <id>",
+  "--source-root <path>",
+  "--source-kind codex",
+  "--index-db <path>",
+] as const;
+
+export function renderInspectSubcommandHelp(input: {
+  name: string;
+  subject: InspectHelpSubject;
+}): string {
+  const { name, subject } = input;
+
+  if (subject === "source") {
+    return [
+      `inspect ${subject}`,
+      "",
+      "Inspect configured source metadata, storage paths, and index location.",
+      "",
+      "Usage",
+      `  ${name} inspect source`,
+      "",
+      "Global Options",
+      ...inspectGlobalOptions.map((option) => `  ${option}`),
+      "",
+      "Examples",
+      `  ${name} inspect source`,
+      `  ${name} --json inspect source`,
+      `  ${name} --source-root ~/.codex inspect source`,
+    ].join("\n");
+  }
+
+  if (subject === "index") {
+    return [
+      `inspect ${subject}`,
+      "",
+      "Inspect index stats, provider counts, and top observed cwd summaries.",
+      "",
+      "Usage",
+      `  ${name} inspect index`,
+      "",
+      "Global Options",
+      ...inspectGlobalOptions.map((option) => `  ${option}`),
+      "",
+      "Examples",
+      `  ${name} inspect index`,
+      `  ${name} --json inspect index`,
+      `  ${name} --refresh inspect index`,
+    ].join("\n");
+  }
+
+  if (subject === "thread") {
+    return [
+      `inspect ${subject}`,
+      "",
+      "Inspect one thread and optionally include related threads from the same cwd.",
+      "",
+      "Usage",
+      `  ${name} inspect thread <thread-id>`,
+      `  ${name} inspect thread <thread-id> --related`,
+      "",
+      "Global Options",
+      ...inspectGlobalOptions.map((option) => `  ${option}`),
+      "",
+      "Local Options",
+      "  --related",
+      "",
+      "Examples",
+      `  ${name} inspect thread 019d8985-6fa4-7792-b92c-4fcc008b212f`,
+      `  ${name} --json inspect thread 019d8985-6fa4-7792-b92c-4fcc008b212f --related`,
+    ].join("\n");
+  }
+
+  return [
+    `inspect ${subject}`,
+    "",
+    "Inspect observed cwd rows and the recommended query scope for follow-up find/recent calls.",
+    "",
+    "Usage",
+    `  ${name} inspect paths`,
+    `  ${name} inspect paths --match mercpay`,
+    `  ${name} inspect paths --repo /path/to/repo`,
+    "",
+    "Global Options",
+    ...inspectGlobalOptions.map((option) => `  ${option}`),
+    "",
+    "Local Options",
+    "  --match <text>",
+    "  --cwd <path>",
+    "  --repo <path>",
+    "  --worktree <path>",
+    "  --limit <n>",
+    "",
+    "Notes",
+    "  Scope flags here filter observed path rows only.",
+    "  Use the chosen scope with `find` or `recent` for actual history queries.",
+    "",
+    "Examples",
+    `  ${name} inspect paths --match mercpay`,
+    `  ${name} inspect paths --repo /Users/me/src/mercpay`,
+    `  ${name} find "payment callback" --repo /Users/me/src/mercpay --kind message`,
   ].join("\n");
 }
 

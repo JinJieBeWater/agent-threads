@@ -66,6 +66,7 @@ ath find "refactor pattern"
 ath find "retry strategy" --kind message
 ath inspect paths
 ath inspect paths --match mercpay
+ath inspect paths --repo /path/to/repo
 ath find "retry strategy" --repo /path/to/repo
 ath find "retry strategy" --worktree /path/to/repo.worktrees/feat-x
 ath recent --limit 20
@@ -114,6 +115,7 @@ ath --json find "error handling"
 ath --json find "retry strategy" --kind message
 ath --json inspect paths
 ath --json inspect paths --match mercpay
+ath --json inspect paths --repo /path/to/repo
 ath --json find "retry strategy" --repo /path/to/repo
 ath --json find "retry strategy" --worktree /path/to/repo.worktrees/feat-x
 ath --json recent --limit 10
@@ -152,6 +154,7 @@ For agent workflows, prefer scope-first history search:
 ```bash
 ath --json inspect paths
 ath --json inspect paths --match mercpay
+ath --json inspect paths --repo /Users/me/src/mercpay
 ```
 
 2. Prefer the returned `recommended_scope`, `repo_scope`, `worktree_scope`, and `live_status` fields.
@@ -163,19 +166,28 @@ git rev-parse --show-toplevel
 git worktree list --porcelain
 ```
 
-5. Query `ath` with exactly one scope flag:
+5. Query `find` or `recent` with exactly one scope flag:
 - `--worktree` for one worktree domain
 - `--repo` for the main repo plus sibling `.worktrees/*`
 - `--cwd` only for exact-directory matching
+Those same flags are also accepted by `inspect paths`, but there they only filter returned path rows.
 6. Use unscoped `ath find` or `ath recent` only as a fallback when no plausible scope can be inferred.
 
 Notes:
 
 - `inspect paths` is derived from indexed thread history, so it tells you where sessions already exist.
 - When a returned path still exists, `inspect paths` also attempts live Git resolution and returns `live_status`, `live_repo_scope`, and `live_worktree_scope`.
+- `inspect paths --repo /repo` is a path-row filter, not repo-scoped text search.
 - `git worktree list` is authoritative for one repo.
 - `~/.codex/worktrees` can provide extra hints about Codex-managed worktrees, but it is not a complete registry of all worktrees on the machine.
 - Historical Codex thread metadata in `state_5.sqlite` also includes `cwd`, `git_branch`, and `git_origin_url`, which can help infer relevant repo families, but that is historical data, not a live inventory.
+
+Shortest correct pattern:
+
+```bash
+ath --json inspect paths --match mercpay
+ath --json find "payment callback" --repo /Users/me/src/mercpay --kind message
+```
 
 ## Search by Time Range
 

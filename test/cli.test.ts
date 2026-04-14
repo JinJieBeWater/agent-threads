@@ -529,6 +529,27 @@ function makeSessionJsonl(input: {
   ].join("\n");
 }
 
+function makeSessionMetaOnlyJsonl(input: {
+  threadId: string;
+  title: string;
+  cwd?: string;
+  provider?: string;
+}) {
+  return [
+    JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: input.threadId,
+        cwd: input.cwd ?? "/tmp/project",
+        source: "cli",
+        model_provider: input.provider ?? "Spencer",
+        thread_name: input.title,
+      },
+    }),
+    "",
+  ].join("\n");
+}
+
 function writeSessionIndex(
   root: string,
   entries: Array<{
@@ -1057,6 +1078,148 @@ test("inspect paths supports match filtering and compact human output", () => {
   expect(humanResult.stdout).toContain(`scope: --worktree ${worktreeRoot}`);
 });
 
+test("inspect paths supports cwd, repo, and worktree scope filters", () => {
+  const repoRoot = "/tmp/scoped-project";
+  const worktreeRoot = "/tmp/scoped-project.worktrees/feat-a";
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-main-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-root",
+        title: "Main root",
+        cwd: repoRoot,
+        messages: [{ timestamp: "2026-04-11T05:00:00.000Z", role: "user", text: "alpha" }],
+      }),
+    },
+    {
+      fileName: "rollout-main-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "main-subdir",
+        title: "Main subdir",
+        cwd: `${repoRoot}/packages/app`,
+        messages: [{ timestamp: "2026-04-11T04:00:00.000Z", role: "user", text: "beta" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-root.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-root",
+        title: "Worktree root",
+        cwd: worktreeRoot,
+        messages: [{ timestamp: "2026-04-11T03:00:00.000Z", role: "user", text: "gamma" }],
+      }),
+    },
+    {
+      fileName: "rollout-worktree-subdir.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "worktree-subdir",
+        title: "Worktree subdir",
+        cwd: `${worktreeRoot}/apps/web`,
+        messages: [{ timestamp: "2026-04-11T02:00:00.000Z", role: "user", text: "delta" }],
+      }),
+    },
+    {
+      fileName: "rollout-other.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "other-project",
+        title: "Other project",
+        cwd: "/tmp/other-project",
+        messages: [{ timestamp: "2026-04-11T01:00:00.000Z", role: "user", text: "epsilon" }],
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-root.jsonl"),
+    cwd: repoRoot,
+    title: "Main root",
+    updatedAt: 1_744_350_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "main-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-main-subdir.jsonl"),
+    cwd: `${repoRoot}/packages/app`,
+    title: "Main subdir",
+    updatedAt: 1_744_349_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-root",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-root.jsonl"),
+    cwd: worktreeRoot,
+    title: "Worktree root",
+    updatedAt: 1_744_348_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "worktree-subdir",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-worktree-subdir.jsonl"),
+    cwd: `${worktreeRoot}/apps/web`,
+    title: "Worktree subdir",
+    updatedAt: 1_744_347_000_000,
+    gitBranch: "feat-a",
+    gitOriginUrl: "https://example.com/scoped-project.git",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "other-project",
+    rolloutPath: join(sourceRoot, "sessions", "2026", "04", "11", "rollout-other.jsonl"),
+    cwd: "/tmp/other-project",
+    title: "Other project",
+    updatedAt: 1_744_346_000_000,
+    gitBranch: "main",
+    gitOriginUrl: "https://example.com/other-project.git",
+  });
+
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const repoResult = runCli(["--json", "--refresh", "inspect", "paths", "--repo", repoRoot, "--limit", "10"], sourceRoot, indexDb);
+  expect(repoResult.status).toBe(0);
+  const repoPayload = JSON.parse(repoResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(repoPayload.data.results.map((row) => row.cwd)).toEqual([
+    repoRoot,
+    `${repoRoot}/packages/app`,
+    worktreeRoot,
+    `${worktreeRoot}/apps/web`,
+  ]);
+
+  const worktreeResult = runCli(
+    ["--json", "inspect", "paths", "--worktree", worktreeRoot, "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(worktreeResult.status).toBe(0);
+  const worktreePayload = JSON.parse(worktreeResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(worktreePayload.data.results.map((row) => row.cwd)).toEqual([worktreeRoot, `${worktreeRoot}/apps/web`]);
+
+  const cwdResult = runCli(
+    ["--json", "inspect", "paths", "--cwd", `${repoRoot}/packages/app`, "--limit", "10"],
+    sourceRoot,
+    indexDb,
+  );
+  expect(cwdResult.status).toBe(0);
+  const cwdPayload = JSON.parse(cwdResult.stdout) as {
+    ok: true;
+    data: { results: Array<Record<string, unknown>> };
+  };
+  expect(cwdPayload.data.results.map((row) => row.cwd)).toEqual([`${repoRoot}/packages/app`]);
+});
+
 test("inspect paths marks existing non-git directories as not_git", () => {
   const nonGitDir = mkdtempSync(join(tmpdir(), "agent-threads-non-git-"));
   const sourceRoot = makeSourceRootFromSessionFiles([
@@ -1201,6 +1364,143 @@ test("incremental sync indexes a newly added session file without rebuilding oth
   expect(readThreadCount(indexDb)).toBe(2);
   expect(readIndexedThread(indexDb, "thread-new")?.message_count).toBe(2);
   expect(readIndexedThread(indexDb, "thread-epay-fix")?.message_count).toBe(original?.message_count);
+});
+
+test("fresh recent builds keep zero-message threads consistent with explicit reindex", () => {
+  const sourceRoot = makeSourceRootFromSessionFiles([
+    {
+      fileName: "rollout-thread-a.jsonl",
+      contents: makeSessionJsonl({
+        threadId: "thread-a",
+        title: "Thread A",
+        cwd: "/tmp/thread-a",
+        messages: [
+          {
+            timestamp: "2026-04-11T03:00:00.000Z",
+            role: "user",
+            text: "alpha question",
+          },
+          {
+            timestamp: "2026-04-11T03:00:15.000Z",
+            role: "assistant",
+            text: "alpha answer",
+          },
+        ],
+      }),
+    },
+    {
+      fileName: "rollout-thread-empty-1.jsonl",
+      contents: makeSessionMetaOnlyJsonl({
+        threadId: "thread-empty-1",
+        title: "Thread empty 1",
+        cwd: "/tmp/thread-empty-1",
+      }),
+    },
+    {
+      fileName: "rollout-thread-empty-2.jsonl",
+      contents: makeSessionMetaOnlyJsonl({
+        threadId: "thread-empty-2",
+        title: "Thread empty 2",
+        cwd: "/tmp/thread-empty-2",
+      }),
+    },
+  ]);
+  const stateDb = join(sourceRoot, "state_5.sqlite");
+  const sessionsDir = join(sourceRoot, "sessions", "2026", "04", "11");
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "thread-a",
+    rolloutPath: join(sessionsDir, "rollout-thread-a.jsonl"),
+    cwd: "/tmp/thread-a",
+    title: "Thread A",
+    updatedAt: Date.parse("2026-04-11T03:00:15.000Z"),
+    firstUserMessage: "alpha question",
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "thread-empty-1",
+    rolloutPath: join(sessionsDir, "rollout-thread-empty-1.jsonl"),
+    cwd: "/tmp/thread-empty-1",
+    title: "Thread empty 1",
+    updatedAt: Date.parse("2026-04-11T03:10:00.000Z"),
+  });
+  insertStateThread({
+    dbPath: stateDb,
+    threadId: "thread-empty-2",
+    rolloutPath: join(sessionsDir, "rollout-thread-empty-2.jsonl"),
+    cwd: "/tmp/thread-empty-2",
+    title: "Thread empty 2",
+    updatedAt: Date.parse("2026-04-11T03:20:00.000Z"),
+  });
+
+  const recent = runCli(["--json", "recent", "--limit", "10"], sourceRoot, indexDb);
+  expect(recent.status).toBe(0);
+
+  const statsBeforeResult = runCli(
+    [
+      "--json",
+      "admin",
+      "sql",
+      "select count(*) as thread_count, coalesce(sum(message_count), 0) as message_count, sum(case when message_count = 0 then 1 else 0 end) as zero_message_threads from threads",
+    ],
+    sourceRoot,
+    indexDb,
+  );
+  expect(statsBeforeResult.status).toBe(0);
+  const statsBeforePayload = JSON.parse(statsBeforeResult.stdout) as {
+    ok: true;
+    data: Array<{ thread_count: number; message_count: number; zero_message_threads: number }>;
+  };
+  const statsBefore = statsBeforePayload.data[0];
+
+  const inspect = runCli(["--json", "inspect", "index"], sourceRoot, indexDb);
+  expect(inspect.status).toBe(0);
+  const inspectPayload = JSON.parse(inspect.stdout) as {
+    ok: true;
+    data: { thread_count: number; message_count: number };
+  };
+
+  expect(readThreadCount(indexDb)).toBe(3);
+  expect(readIndexedThread(indexDb, "thread-empty-1")?.message_count).toBe(0);
+  expect(readIndexedThread(indexDb, "thread-empty-2")?.message_count).toBe(0);
+  expect(statsBefore).toEqual({
+    thread_count: 3,
+    message_count: 2,
+    zero_message_threads: 2,
+  });
+  expect(inspectPayload.data.thread_count).toBe(statsBefore.thread_count);
+  expect(inspectPayload.data.message_count).toBe(statsBefore.message_count);
+
+  const reindex = runCli(["--json", "admin", "reindex"], sourceRoot, indexDb);
+  expect(reindex.status).toBe(0);
+  const reindexPayload = JSON.parse(reindex.stdout) as {
+    ok: true;
+    data: { threadCount: number; messageCount: number };
+  };
+
+  const statsAfterResult = runCli(
+    [
+      "--json",
+      "admin",
+      "sql",
+      "select count(*) as thread_count, coalesce(sum(message_count), 0) as message_count, sum(case when message_count = 0 then 1 else 0 end) as zero_message_threads from threads",
+    ],
+    sourceRoot,
+    indexDb,
+  );
+  expect(statsAfterResult.status).toBe(0);
+  const statsAfterPayload = JSON.parse(statsAfterResult.stdout) as {
+    ok: true;
+    data: Array<{ thread_count: number; message_count: number; zero_message_threads: number }>;
+  };
+
+  expect(reindexPayload.data.threadCount).toBe(statsBefore.thread_count);
+  expect(reindexPayload.data.messageCount).toBe(statsBefore.message_count);
+  expect(statsAfterPayload.data[0]).toEqual(statsBefore);
+  expect(readIndexedThread(indexDb, "thread-empty-1")?.message_count).toBe(0);
+  expect(readIndexedThread(indexDb, "thread-empty-2")?.message_count).toBe(0);
 });
 
 test("incremental sync rebuilds only the changed thread", () => {
@@ -2160,6 +2460,52 @@ test("repo and worktree scope options are mutually exclusive", () => {
   expect(payload.error.message).toBe("Use only one of --cwd, --repo, or --worktree.");
 });
 
+test("inspect paths scope options are mutually exclusive", () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
+
+  const result = runCli(
+    [
+      "--json",
+      "--refresh",
+      "inspect",
+      "paths",
+      "--repo",
+      "/tmp/scoped-project",
+      "--worktree",
+      "/tmp/scoped-project.worktrees/feat-a",
+    ],
+    sourceRoot,
+    indexDb,
+  );
+
+  expect(result.status).toBe(1);
+  const payload = JSON.parse(result.stdout) as {
+    ok: false;
+    error: { code: string; message: string };
+  };
+  expect(payload.error.code).toBe("invalid-argument");
+  expect(payload.error.message).toBe("Use only one of --cwd, --repo, or --worktree.");
+});
+
+test("bare cli output stays compact and task-oriented", () => {
+  const result = spawnSync("bun", ["run", cliEntry], {
+    cwd: projectRoot,
+    encoding: "utf8",
+  });
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("Local CLI for searching and reading agent session history.");
+  expect(result.stdout).toContain("ath inspect paths --match mercpay");
+  expect(result.stdout).toContain('ath find "error handling" --repo /path/to/repo');
+  expect(result.stdout).toContain("Commands");
+  expect(result.stdout).toContain("find <query>");
+  expect(result.stdout).toContain("inspect <subcommand>");
+  expect(result.stdout).toContain("ath --help");
+  expect(result.stdout).not.toContain("OPTIONS");
+  expect(result.stdout).not.toContain("--wizard");
+});
+
 test("find supports absolute time filters", () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(sourceRoot, "cache", "agent-threads", "index.sqlite");
@@ -2272,22 +2618,6 @@ test("json output is compact by default", () => {
   expect(result.stdout.startsWith("{\"ok\":true,")).toBe(true);
 });
 
-test("bare cli output stays compact and task-oriented", () => {
-  const result = spawnSync("bun", ["run", cliEntry], {
-    cwd: projectRoot,
-    encoding: "utf8",
-  });
-
-  expect(result.status).toBe(0);
-  expect(result.stdout).toContain("Local CLI for searching and reading agent session history.");
-  expect(result.stdout).toContain('ath find "error handling"');
-  expect(result.stdout).toContain("Commands");
-  expect(result.stdout).toContain("find <query>");
-  expect(result.stdout).toContain("ath --help");
-  expect(result.stdout).not.toContain("OPTIONS");
-  expect(result.stdout).not.toContain("--wizard");
-});
-
 test("help output remains available through the effect CLI shell", () => {
   const result = runRawCli(["--help"]);
 
@@ -2365,6 +2695,69 @@ test("subcommand help stays on the intended command surface", () => {
   expect(result.stdout).toContain("$ find");
   expect(result.stdout).toContain("<query>");
   expect(result.stdout).toContain("--limit integer");
+});
+
+test("inspect help enumerates supported subjects", () => {
+  const result = runRawCli(["inspect", "--help"]);
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("inspect");
+  expect(result.stdout).toContain("Inspect source state, index state, one thread, or observed path scopes.");
+  expect(result.stdout).toContain("Subcommands");
+  expect(result.stdout).toContain("source");
+  expect(result.stdout).toContain("index");
+  expect(result.stdout).toContain("thread");
+  expect(result.stdout).toContain("paths");
+  expect(result.stdout).toContain("ath inspect <subcommand> --help");
+  expect(result.stdout).toContain("ath inspect paths --help");
+  expect(result.stdout).not.toContain("--repo text");
+  expect(result.stdout).not.toContain("Required only for `thread`");
+  expect(result.stdout).not.toContain("COMMANDS");
+});
+
+test("inspect source help omits path-scope filters", () => {
+  const result = runRawCli(["inspect", "source", "--help"]);
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("inspect source");
+  expect(result.stdout).toContain("Usage");
+  expect(result.stdout).toContain("ath inspect source");
+  expect(result.stdout).not.toContain("--repo text");
+  expect(result.stdout).not.toContain("--worktree text");
+  expect(result.stdout).not.toContain("--cwd text");
+});
+
+test("inspect paths help isolates scope filters to the paths subcommand", () => {
+  const result = runRawCli(["inspect", "paths", "--help"]);
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("inspect paths");
+  expect(result.stdout).toContain("Usage");
+  expect(result.stdout).toContain("ath inspect paths --repo /path/to/repo");
+  expect(result.stdout).toContain("--repo <path>");
+  expect(result.stdout).toContain("--worktree <path>");
+  expect(result.stdout).toContain("--cwd <path>");
+  expect(result.stdout).toContain("Scope flags here filter observed path rows only.");
+});
+
+test("bare inspect output stays compact and task-oriented", () => {
+  const result = runRawCli(["inspect"]);
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("Inspect source state, index state, one thread, or observed path scopes.");
+  expect(result.stdout).toContain("Subcommands");
+  expect(result.stdout).toContain("ath inspect paths --match mercpay");
+  expect(result.stdout).toContain("ath inspect <subcommand> --help");
+  expect(result.stdout).not.toContain("--repo text");
+});
+
+test("admin help enumerates supported actions", () => {
+  const result = runRawCli(["admin", "--help"]);
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("$ admin");
+  expect(result.stdout).toContain("init, reindex, sql");
+  expect(result.stdout).toContain("Used only by `sql`");
 });
 
 test("find rejects non-positive limit values", () => {

@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Threads"
   short_description: "Search local agent history with ath."
-  default_prompt: "Use $agent-threads to find a relevant past conversation with ath, inspect the exact context you need, and reuse the useful pattern safely."
+  default_prompt: "Use $agent-threads to inspect paths first, choose one recommended scope, then use find or recent with exactly one of --repo, --worktree, or --cwd. Treat inspect paths scope flags as row filters only, not as message search scope."

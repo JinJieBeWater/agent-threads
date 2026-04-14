@@ -5,7 +5,10 @@ import {
   handleAdmin,
   handleFind,
   handleExportAction,
-  handleInspect,
+  handleInspectIndex,
+  handleInspectPaths,
+  handleInspectSource,
+  handleInspectThread,
   handleOpen,
   handleRecent,
 } from "./handlers.ts";
@@ -148,17 +151,59 @@ function toOpenActionOptions(input: {
   });
 }
 
-function toInspectActionOptions(input: {
+function toInspectPathsActionOptions(input: {
   match: Option.Option<string>;
+  cwd: Option.Option<string>;
+  repo: Option.Option<string>;
+  worktree: Option.Option<string>;
   limit: number;
 }): Effect.Effect<InspectActionOptions, CliFailure> {
   return Effect.gen(function* () {
+    const scope = yield* normalizeQueryScope({
+      cwd: Option.getOrUndefined(input.cwd),
+      repo: Option.getOrUndefined(input.repo),
+      worktree: Option.getOrUndefined(input.worktree),
+    });
     return {
+      ...scope,
       match: Option.getOrUndefined(input.match),
       limit: yield* validateIntegerOption(input.limit, "--limit", (value) => value > 0),
     };
   });
 }
+
+const inspectPathsCwdOption = Options.optional(
+  Options.text("cwd").pipe(
+    Options.withDescription("Used only by `paths` to filter one exact observed cwd row."),
+  ),
+);
+
+const inspectPathsRepoOption = Options.optional(
+  Options.text("repo").pipe(
+    Options.withDescription("Used only by `paths` to filter rows that belong to one repo scope."),
+  ),
+);
+
+const inspectPathsWorktreeOption = Options.optional(
+  Options.text("worktree").pipe(
+    Options.withDescription("Used only by `paths` to filter rows that belong to one worktree scope."),
+  ),
+);
+
+const adminActionArg = Args.choice(
+  [
+    ["init", "init"],
+    ["reindex", "reindex"],
+    ["sql", "sql"],
+  ] as const,
+  { name: "action" },
+).pipe(Args.withDescription("Run one of the supported admin actions: init, reindex, or sql."));
+
+const adminPayloadArg = Args.optional(
+  Args.text({ name: "payload" }).pipe(
+    Args.withDescription("Used only by `sql`, where it must be a read-only SELECT or WITH query."),
+  ),
+);
 
 const findCommand = Command.make(
   "find",
@@ -236,14 +281,51 @@ const openCommand = Command.make(
   },
 );
 
-const inspectCommand = Command.make(
-  "inspect",
+const inspectSourceCommand = Command.make(
+  "source",
   {
     ...globalOptionsConfig,
-    subject: Args.text({ name: "subject" }),
-    value: Args.optional(Args.text({ name: "value" })),
+  },
+  (input) => {
+    const options = toGlobalOptions(input);
+    return emitEffectResult("inspect", options, handleInspectSource(options));
+  },
+);
+
+const inspectIndexCommand = Command.make(
+  "index",
+  {
+    ...globalOptionsConfig,
+  },
+  (input) => {
+    const options = toGlobalOptions(input);
+    return emitEffectResult("inspect", options, handleInspectIndex(options));
+  },
+);
+
+const inspectThreadCommand = Command.make(
+  "thread",
+  {
+    ...globalOptionsConfig,
+    threadId: Args.text({ name: "threadId" }).pipe(
+      Args.withDescription("The thread id to inspect."),
+    ),
     related: Options.boolean("related"),
+  },
+  (input) => {
+    const options = toGlobalOptions(input);
+    return emitEffectResult("inspect", options, handleInspectThread(input.threadId, input.related, options));
+  },
+);
+
+const inspectPathsCommand = Command.make(
+  "paths",
+  {
+    ...globalOptionsConfig,
     match: Options.optional(Options.text("match")),
+    cwd: inspectPathsCwdOption,
+    repo: inspectPathsRepoOption,
+    worktree: inspectPathsWorktreeOption,
     limit: Options.integer("limit").pipe(Options.withDefault(50)),
   },
   (input) => {
@@ -252,17 +334,20 @@ const inspectCommand = Command.make(
       "inspect",
       options,
       Effect.gen(function* () {
-        const actionOptions = yield* toInspectActionOptions(input);
-        return yield* handleInspect(
-          input.subject,
-          Option.getOrUndefined(input.value),
-          input.related,
-          actionOptions,
-          options,
-        );
+        const actionOptions = yield* toInspectPathsActionOptions(input);
+        return yield* handleInspectPaths(actionOptions, options);
       }),
     );
   },
+);
+
+const inspectCommand = Command.make("inspect", {}).pipe(
+  Command.withSubcommands([
+    inspectSourceCommand,
+    inspectIndexCommand,
+    inspectThreadCommand,
+    inspectPathsCommand,
+  ]),
 );
 
 const exportCommand = Command.make(
@@ -287,8 +372,8 @@ const adminCommand = Command.make(
   "admin",
   {
     ...globalOptionsConfig,
-    action: Args.text({ name: "action" }),
-    payload: Args.optional(Args.text({ name: "payload" })),
+    action: adminActionArg,
+    payload: adminPayloadArg,
     source: Options.optional(Options.text("source")),
     sourceKind: Options.optional(Options.choice("source-kind", ["codex"])),
   },

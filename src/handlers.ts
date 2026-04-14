@@ -379,6 +379,41 @@ export function handleInspectSource(options: GlobalOptions): Effect.Effect<Recor
   });
 }
 
+export function handleInspectIndex(options: GlobalOptions): Effect.Effect<unknown, CliFailure> {
+  return withReadyIndex(options, getThreadStats);
+}
+
+export function handleInspectThread(
+  threadId: string,
+  related: boolean,
+  options: GlobalOptions,
+): Effect.Effect<unknown, CliFailure> {
+  return withReadyIndex(options, (paths) =>
+    Effect.gen(function* () {
+      const thread = yield* getExistingThread(paths, yield* ensureValue(threadId, "thread id"));
+      return {
+        thread,
+        related: related ? yield* getRelatedThreads(paths, threadId, 10) : [],
+      };
+    }),
+  );
+}
+
+export function handleInspectPaths(
+  actionOptions: InspectActionOptions,
+  options: GlobalOptions,
+): Effect.Effect<unknown, CliFailure> {
+  return withReadyIndex(options, (paths) =>
+    getObservedPaths(paths, {
+      match: actionOptions.match,
+      cwd: actionOptions.cwd,
+      repo: actionOptions.repo,
+      worktree: actionOptions.worktree,
+      limit: actionOptions.limit,
+    }),
+  );
+}
+
 export function handleAdminInit(options: GlobalOptions): Effect.Effect<Record<string, unknown>, CliFailure> {
   return Effect.gen(function* () {
     const resolved = yield* resolvePaths(options);
@@ -592,46 +627,6 @@ export function handleOpen(
       };
     }),
   );
-}
-
-export function handleInspect(
-  subject: string,
-  value: string | undefined,
-  related: boolean,
-  actionOptions: InspectActionOptions,
-  options: GlobalOptions,
-): Effect.Effect<unknown, CliFailure> {
-  if (subject === "source") {
-    return handleInspectSource(options);
-  }
-
-  if (subject === "index") {
-    return withReadyIndex(options, getThreadStats);
-  }
-
-  if (subject === "thread") {
-    return withReadyIndex(options, (paths) =>
-      Effect.gen(function* () {
-        const threadId = yield* ensureValue(value, "thread id");
-        const thread = yield* getExistingThread(paths, threadId);
-        return {
-          thread,
-          related: related ? yield* getRelatedThreads(paths, threadId, 10) : [],
-        };
-      }),
-    );
-  }
-
-  if (subject === "paths") {
-    return withReadyIndex(options, (paths) =>
-      getObservedPaths(paths, {
-        match: actionOptions.match,
-        limit: actionOptions.limit,
-      }),
-    );
-  }
-
-  return fail("invalid-command", `Unknown inspect subject: ${subject}`);
 }
 
 export function handleAdmin(

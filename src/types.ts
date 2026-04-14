@@ -18,7 +18,7 @@ export interface ExportActionOptions {
   out?: string;
 }
 
-export interface InspectActionOptions {
+export interface InspectActionOptions extends QueryScopeOptions {
   match?: string;
   limit: number;
 }

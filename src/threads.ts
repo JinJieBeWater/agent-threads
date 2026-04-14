@@ -71,6 +71,50 @@ function startsWithScope(path: string, scope: string | null): boolean {
   return typeof scope === "string" && (path === scope || path.startsWith(`${scope}${sep}`));
 }
 
+interface ObservedPathResultRow {
+  cwd: string;
+  path_kind: "cwd" | "repo" | "worktree";
+  repo_scope: string | null;
+  worktree_scope: string | null;
+  path_exists: boolean;
+  live_status: string;
+  live_repo_scope: string | null;
+  live_worktree_scope: string | null;
+  live_error: string | null;
+  recommended_scope: {
+    kind: "cwd" | "repo" | "worktree";
+    flag: "--cwd" | "--repo" | "--worktree";
+    value: string;
+  };
+  thread_count: number;
+  last_updated_at: string | null;
+  sample_branch: string | null;
+  sample_origin: string | null;
+}
+
+function matchesObservedPathScopeFilter(
+  row: ObservedPathResultRow,
+  scope: QueryScopeOptions,
+): boolean {
+  if (scope.cwd) {
+    return row.cwd === scope.cwd;
+  }
+
+  if (scope.worktree) {
+    return row.worktree_scope === scope.worktree || startsWithScope(row.cwd, scope.worktree);
+  }
+
+  if (scope.repo) {
+    return (
+      row.repo_scope === scope.repo ||
+      startsWithScope(row.cwd, scope.repo) ||
+      startsWithScope(row.cwd, `${scope.repo}.worktrees`)
+    );
+  }
+
+  return true;
+}
+
 function aliasScopePath(cwd: string, resolvedPath: string | null, canonicalScope: string | null): string | null {
   if (!canonicalScope) {
     return null;
@@ -562,6 +606,9 @@ export function getObservedPaths(
   paths: ResolvedPaths,
   options: {
     match?: string;
+    cwd?: string;
+    repo?: string;
+    worktree?: string;
     limit: number;
   },
 ): Effect.Effect<Record<string, unknown>, CliFailure> {
@@ -584,7 +631,6 @@ export function getObservedPaths(
         );
       }
 
-      params.push(options.limit);
       const rows = yield* all<Record<string, unknown>>(
         db,
         `
@@ -598,7 +644,6 @@ export function getObservedPaths(
             WHERE ${where.join(" AND ")}
             GROUP BY cwd
             ORDER BY last_updated_at DESC NULLS LAST, thread_count DESC, cwd ASC
-            LIMIT ?
           `,
         ...params,
       );
@@ -659,7 +704,7 @@ export function getObservedPaths(
         }
       }
 
-      const results = liveRows.map((row) => {
+      const results: ObservedPathResultRow[] = liveRows.map((row) => {
         const liveRepoScope = aliasScopePath(row.cwd, row.resolved_path, row.live_repo_scope);
         const liveWorktreeScope = aliasScopePath(row.cwd, row.resolved_path, row.live_worktree_scope);
         let repoScope = liveRepoScope ?? row.observed_repo_scope;
@@ -703,7 +748,7 @@ export function getObservedPaths(
           pathKind = "cwd";
         }
 
-        const recommendedScope =
+        const recommendedScope: ObservedPathResultRow["recommended_scope"] =
           worktreeScope && canonicalScopedWorktree
             ? {
                 kind: "worktree",
@@ -740,10 +785,12 @@ export function getObservedPaths(
         };
       });
 
+      const filteredResults = results.filter((row) => matchesObservedPathScopeFilter(row, options));
+
       return {
         subject: "paths",
         match: options.match ?? null,
-        results,
+        results: filteredResults.slice(0, options.limit),
       };
     }),
   );
