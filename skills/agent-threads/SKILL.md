@@ -36,12 +36,43 @@ make install-local
 
 ## Workflow
 
-1. Scope first: determine which repo or worktree the user question belongs to before querying history.
-2. Inspect observed session paths: `ath --json inspect paths`
-3. Discover: use scoped `ath --json find ...` or `ath --json recent ...`
-4. Open: `ath --json open <thread-id>`
-5. Zoom in: `ath --json open <thread-id>:12 --before 2 --after 3`
-6. Export if needed: `ath --json export <thread-id> --format md --out /tmp/thread.md`
+Choose one of these paths first:
+
+1. Exact thread id path:
+   `ath --json inspect thread <thread-id> --related`
+   `ath --json open <thread-id>:<seq> --before 0 --after 0` when the needed answer is likely one message
+   `ath --json open <thread-id>` only when you need broader thread context
+2. Scoped discovery path:
+   determine which repo or worktree the user question belongs to
+   inspect observed session paths with `ath --json inspect paths`
+   use scoped `ath --json find ...` or `ath --json recent ...`
+   open the chosen result with `ath --json open <thread-id>` or `ath --json open <thread-id>:<seq>`
+3. Export if needed:
+   `ath --json export <thread-id> --format md --out /tmp/thread.md`
+
+### Exact Thread Id First
+
+If the user already provides an exact thread id, do not search for that id with `find`.
+
+Use this order instead:
+
+```bash
+ath --json inspect thread 019d8985-6fa4-7792-b92c-4fcc008b212f --related
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f:11 --before 0 --after 0
+```
+
+Only widen to a broader read if needed:
+
+```bash
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f --format messages
+```
+
+Common mistake:
+
+- Do not run `ath --json find "<thread-id>" ...` when the id is already known.
+- That only searches message text containing the id and can just match the current user prompt.
+- Treat exact ids as primary keys, not as text queries.
 
 ### Scope First
 
@@ -123,6 +154,7 @@ Only use read-only `SELECT` or `WITH` SQL.
 ## Rules
 
 - Prefer `--json`; use `--json-pretty` only for human debugging.
+- If the user provides an exact thread id, prefer `inspect thread` and direct `open`; do not start with `find` or `recent`.
 - Prefer `inspect paths` before project-scoped history search.
 - Prefer repo/worktree-scoped queries over global queries.
 - Determine the most likely repo/worktree before calling `ath` when the user question is project-specific.

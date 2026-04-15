@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Threads"
   short_description: "Search local agent history with ath."
-  default_prompt: "Use $agent-threads to inspect paths first, choose one recommended scope, then use find or recent with exactly one of --repo, --worktree, or --cwd. Treat inspect paths scope flags as row filters only, not as message search scope."
+  default_prompt: "Use $agent-threads. If the user provides an exact thread id, do not search for that id with find or recent. Use `ath --json inspect thread <id> --related` first, then `ath --json open <id>:<seq>` for the smallest needed context, widening to `open <id>` or `open <id> --format messages` only when necessary. For fuzzy lookup, inspect paths first, choose one recommended scope, then use find or recent with exactly one of --repo, --worktree, or --cwd. Treat inspect paths scope flags as row filters only, not as message search scope."

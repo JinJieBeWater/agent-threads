@@ -12,14 +12,21 @@ Requirements:
 - Bun `>= 1.3.0`
 - Codex history available at the default source root `~/.codex`
 
-Fast path:
+Two common paths:
 
 ```bash
 bun install
 make install-local
 
 ath --json inspect source
-ath find "error handling"
+
+# Exact thread id
+ath --json inspect thread <thread-id> --related
+ath --json open <thread-id>:12 --before 0 --after 0
+
+# Fuzzy topic lookup
+ath --json inspect paths --match mercpay
+ath --json find "error handling" --repo /path/to/repo
 ```
 
 By default, `ath` reads Codex history from `~/.codex` and stores its local index under `~/.agent-threads`.
@@ -57,11 +64,19 @@ Host-specific entrypoints such as `~/.codex/skills` should reference or mirror t
 
 ## Command Surface
 
-```bash
-ath --json inspect source
-ath admin init --source local-codex --source-root ~/.codex
-ath admin reindex
+Exact thread id:
 
+```bash
+ath inspect thread <thread-id> --related
+ath open <thread-id>:12 --before 0 --after 0
+ath open <thread-id>
+ath open <thread-id> --format messages --full
+ath export <thread-id> --format md --out /tmp/thread.md
+```
+
+Scoped discovery:
+
+```bash
 ath find "refactor pattern"
 ath find "retry strategy" --kind message
 ath inspect paths
@@ -72,21 +87,24 @@ ath find "retry strategy" --worktree /path/to/repo.worktrees/feat-x
 ath recent --limit 20
 ath recent --repo /path/to/repo
 ath recent --since 7d
-ath open <thread-id>
 ath open <thread-id>:12 --before 2 --after 2
-ath open <thread-id> --format messages --full
+```
 
+Diagnostics and maintenance:
+
+```bash
+ath --json inspect source
 ath inspect index
 ath inspect thread <thread-id> --related
-
-ath export <thread-id> --format md --out /tmp/thread.md
+ath admin init --source local-codex --source-root ~/.codex
+ath admin reindex
 ath admin sql "select thread_id, count(*) from messages group by 1 order by 2 desc limit 10"
 ```
 
-Use this executable:
+Primary entrypoint:
 
 ```bash
-ath find "error handling"
+ath --help
 ```
 
 ## Sync Model
@@ -99,14 +117,24 @@ ath find "error handling"
 
 ## Recommended Flow
 
-Use this order unless you already know the exact thread:
+Choose the path that matches the input.
 
-1. `find`
-2. `recent` when you want to see what the user was working on lately
-3. `open <thread-id>` when you want the session
-4. `open <thread-id>:<seq>` when you want local context around one message
-5. `inspect` when you need source or index state
-6. `admin` only for maintenance or advanced SQL
+Exact thread id:
+
+1. `inspect thread <thread-id> --related`
+2. `open <thread-id>:<seq>` when one message is likely enough
+3. `open <thread-id>` only when you need broader thread context
+
+Fuzzy topic or historical decision:
+
+1. `inspect paths`
+2. `find` with exactly one of `--repo`, `--worktree`, or `--cwd`
+3. `recent` only when you want recency rather than keyword matching
+4. `open <thread-id>:<seq>` for local context
+5. `open <thread-id>` only when local context is not enough
+6. `inspect` and `admin` only for metadata, diagnostics, or maintenance
+
+Do not run `find "<thread-id>"` when the exact id is already known. It searches message text containing the id and may just return the current prompt that mentioned it.
 
 Examples:
 
@@ -147,7 +175,35 @@ ath recent --repo /Users/me/src/mercpay --limit 20
 
 ## Agent Usage
 
-For agent workflows, prefer scope-first history search:
+For agent workflows, choose the path that matches the input:
+
+### Exact thread id path
+
+If the user already provides an exact thread id, treat it as a primary key, not a search keyword.
+
+```bash
+ath --json inspect thread 019d8985-6fa4-7792-b92c-4fcc008b212f --related
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f:11 --before 0 --after 0
+```
+
+Only widen if needed:
+
+```bash
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f
+ath --json open 019d8985-6fa4-7792-b92c-4fcc008b212f --format messages
+```
+
+Do not do this:
+
+```bash
+ath --json find "019d8985-6fa4-7792-b92c-4fcc008b212f" --kind message
+```
+
+That only searches for messages whose text contains the id.
+
+### Scoped discovery path
+
+For fuzzy topic lookup, prefer scope-first history search:
 
 1. Ask `ath` which paths already have conversation history:
 
