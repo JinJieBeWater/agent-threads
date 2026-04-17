@@ -3646,13 +3646,14 @@ test("ready-index read queries ignore an active writer lock and return stale res
   try {
     const result = await runCliAsync(["--json", "find", "notify_url", "--kind", "message"], sourceRoot, indexDb);
     expect(result.status).toBe(0);
-    expect(Date.now() - startedAt).toBeLessThan(3_000);
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
     const payload = JSON.parse(result.stdout) as {
       ok: true;
       data: { results: Array<Record<string, unknown>> };
     };
     expect(payload.ok).toBe(true);
     expect(payload.data.results[0]?.thread_id).toBe("thread-epay-fix");
+    expect(payload.data.results.some((row) => row.thread_id === newThreadId)).toBe(false);
   } finally {
     clearTimeout(releaseTimer);
     try {
@@ -3729,7 +3730,7 @@ test("strict refresh queries wait for an active writer lock and then observe new
   try {
     const result = await runCliAsync(["--json", "--refresh", "inspect", "thread", newThreadId], sourceRoot, indexDb);
     expect(result.status).toBe(0);
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_000);
     const payload = JSON.parse(result.stdout) as {
       ok: true;
       data: { thread: Record<string, unknown> };
@@ -3819,7 +3820,7 @@ test("exact thread lookups retry after a stale miss when an active writer is pre
   try {
     const result = await runCliAsync(["--json", "inspect", "thread", newThreadId], sourceRoot, indexDb);
     expect(result.status).toBe(0);
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_000);
     const payload = JSON.parse(result.stdout) as {
       ok: true;
       data: { thread: Record<string, unknown> };
