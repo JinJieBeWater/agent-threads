@@ -1,8 +1,8 @@
 import { Effect } from "effect";
 
 import { CliFailure } from "./errors.ts";
-import { readFileStats, readFileString, readModifiedTime } from "./infra/fs.ts";
-import { all, get, withDatabase } from "./infra/sqlite.ts";
+import { fileExists, readFileStats, readFileString, readModifiedTime, removeFile, renamePath } from "./infra/fs.ts";
+import { all, exec, get, withDatabase } from "./infra/sqlite.ts";
 import {
   buildThreadRecordFromSessions,
   deleteThreadData,
@@ -1055,7 +1055,10 @@ export function canSkipIncrementalSync(paths: ResolvedPaths): Effect.Effect<bool
   });
 }
 
-export function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<RebuildIndexStats, CliFailure> {
+export function rebuildIndexUnlocked(
+  paths: ResolvedPaths,
+  strategy: "shadow-if-existing" | "in-place" = "shadow-if-existing",
+): Effect.Effect<RebuildIndexStats, CliFailure> {
   return Effect.gen(function* () {
     const threadMap = yield* readStateThreads(paths.stateDb);
     const allSessions = yield* scanSourceFiles(paths);
@@ -1064,6 +1067,7 @@ export function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<Rebuil
     const logsHighWater = yield* readLogsHighWater(paths);
     const sourceDirectoryManifest = yield* buildSourceDirectoryManifest(paths, allSessions);
     const parsedSessionsByThread = new Map<string, ParsedSessionFile[]>();
+    const existingMainIndex = yield* fileExists(paths.indexDb).pipe(Effect.catchAll(() => Effect.succeed(false)));
 
     const parsedSessions = yield* Effect.forEach(
       allSessions,
@@ -1091,76 +1095,154 @@ export function rebuildIndexUnlocked(paths: ResolvedPaths): Effect.Effect<Rebuil
       canonicalThreadMessages.set(threadId, canonicalMessages);
     }
 
-    return yield* withDatabase(paths.indexDb, (db) =>
-      Effect.gen(function* () {
-        yield* initializeIndexSchema(db);
+    function buildIndexAt(targetPaths: ResolvedPaths): Effect.Effect<RebuildIndexStats, CliFailure> {
+      return withDatabase(targetPaths.indexDb, (db) =>
+        Effect.gen(function* () {
+          yield* initializeIndexSchema(db);
 
-        const builtAt = new Date().toISOString();
+          const builtAt = new Date().toISOString();
 
-        yield* db.withTransaction(
-          Effect.gen(function* () {
-            yield* resetIndex(db);
+          yield* db.withTransaction(
+            Effect.gen(function* () {
+              yield* resetIndex(db);
 
-            yield* insertThreads(db, Array.from(threadMap.values()));
+              yield* insertThreads(db, Array.from(threadMap.values()));
 
-            for (const messages of canonicalThreadMessages.values()) {
-              yield* insertMessagesTableOnly(db, messages);
-            }
-            yield* rebuildMessagesFtsFromMessages(db);
+              for (const messages of canonicalThreadMessages.values()) {
+                yield* insertMessagesTableOnly(db, messages);
+              }
+              yield* rebuildMessagesFtsFromMessages(db);
 
-            const trackedSourceRows = Array.from(parsedSessionsByThread.entries()).flatMap(([threadId, parsedSessions]) =>
-              parsedSessions.flatMap((parsed) => {
-                const sourceFile = parsed.meta.sourceFile;
-                if (!sourceFile) {
-                  return [];
+              const trackedSourceRows = Array.from(parsedSessionsByThread.entries()).flatMap(([threadId, parsed]) =>
+                parsed.flatMap((session) => {
+                  const sourceFile = session.meta.sourceFile;
+                  if (!sourceFile) {
+                    return [];
+                  }
+                  const snapshot = snapshotByPath.get(sourceFile);
+                  if (!snapshot) {
+                    return [];
+                  }
+                  return [
+                    {
+                      threadId,
+                      snapshot,
+                      lastStateUpdatedAt: Number(threadMap.get(threadId)?.updatedAt ?? 0),
+                      seenAt: builtAt,
+                    },
+                  ];
+                }),
+              );
+              yield* upsertThreadSources(db, trackedSourceRows);
+
+              yield* refreshIndexMeta(db, targetPaths, allSessions, builtAt);
+              const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
+              yield* refreshSyncMeta(db, stateDbMtime, sourceFingerprint, sourceDirectoryManifest, logsHighWater, builtAt);
+            }),
+          ).pipe(
+            Effect.mapError((cause) => new CliFailure({ code: "sqlite-error", message: String(cause) })),
+          );
+
+          yield* exec(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+
+          const totals = yield* get<Record<string, unknown>>(
+            db,
+            `
+              SELECT
+                COUNT(*) AS thread_count,
+                COALESCE(SUM(message_count), 0) AS message_count
+              FROM threads
+            `,
+          ).pipe(
+            Effect.map((row) => ({
+              threadCount: Number(row?.thread_count ?? 0),
+              messageCount: Number(row?.message_count ?? 0),
+            })),
+          );
+
+          return {
+            builtAt,
+            threadCount: totals.threadCount,
+            messageCount: totals.messageCount,
+            activeSessionFileCount: allSessions.filter((snapshot) => snapshot.archived === 0).length,
+            archivedSessionFileCount: allSessions.filter((snapshot) => snapshot.archived === 1).length,
+          } satisfies RebuildIndexStats;
+        }),
+      );
+    }
+
+    if (strategy === "in-place" || !existingMainIndex) {
+      return yield* buildIndexAt(paths);
+    }
+
+    const shadowIndexDb = `${paths.indexDb}.next-${process.pid}-${Date.now()}`;
+    const shadowPaths = {
+      ...paths,
+      indexDb: shadowIndexDb,
+    } satisfies ResolvedPaths;
+
+    const cleanupPaths = [
+      shadowIndexDb,
+      `${shadowIndexDb}-wal`,
+      `${shadowIndexDb}-shm`,
+    ];
+
+    return yield* Effect.acquireUseRelease(
+      Effect.succeed(shadowPaths),
+      (preparedPaths) =>
+        Effect.gen(function* () {
+          const stats = yield* buildIndexAt(preparedPaths);
+
+          yield* removeFile(`${preparedPaths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.void));
+          yield* removeFile(`${preparedPaths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.void));
+
+          const backupSuffix = `.bak-${process.pid}-${Date.now()}`;
+          const backupIndexDb = `${paths.indexDb}${backupSuffix}`;
+          const backupWal = `${backupIndexDb}-wal`;
+          const backupShm = `${backupIndexDb}-shm`;
+
+          const existingMain = yield* fileExists(paths.indexDb).pipe(Effect.catchAll(() => Effect.succeed(false)));
+          const existingWal = yield* fileExists(`${paths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.succeed(false)));
+          const existingShm = yield* fileExists(`${paths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.succeed(false)));
+
+          if (existingMain) {
+            yield* renamePath(paths.indexDb, backupIndexDb);
+          }
+          if (existingWal) {
+            yield* renamePath(`${paths.indexDb}-wal`, backupWal);
+          }
+          if (existingShm) {
+            yield* renamePath(`${paths.indexDb}-shm`, backupShm);
+          }
+
+          yield* renamePath(preparedPaths.indexDb, paths.indexDb).pipe(
+            Effect.catchTag("CliFailure", (error) =>
+              Effect.gen(function* () {
+                if (existingMain) {
+                  yield* renamePath(backupIndexDb, paths.indexDb).pipe(Effect.catchAll(() => Effect.void));
                 }
-                const snapshot = snapshotByPath.get(sourceFile);
-                if (!snapshot) {
-                  return [];
+                if (existingWal) {
+                  yield* renamePath(backupWal, `${paths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.void));
                 }
-                return [
-                  {
-                    threadId,
-                    snapshot,
-                    lastStateUpdatedAt: Number(threadMap.get(threadId)?.updatedAt ?? 0),
-                    seenAt: builtAt,
-                  },
-                ];
+                if (existingShm) {
+                  yield* renamePath(backupShm, `${paths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.void));
+                }
+                return yield* Effect.fail(error);
               }),
-            );
-            yield* upsertThreadSources(db, trackedSourceRows);
+            ),
+          );
 
-            yield* refreshIndexMeta(db, paths, allSessions, builtAt);
-            const stateDbMtime = yield* readModifiedTime(paths.stateDb).pipe(Effect.catchAll(() => Effect.succeed(null)));
-            yield* refreshSyncMeta(db, stateDbMtime, sourceFingerprint, sourceDirectoryManifest, logsHighWater, builtAt);
-          }),
-        ).pipe(
-          Effect.mapError((cause) => new CliFailure({ code: "sqlite-error", message: String(cause) })),
-        );
+          yield* removeFile(backupIndexDb).pipe(Effect.catchAll(() => Effect.void));
+          yield* removeFile(backupWal).pipe(Effect.catchAll(() => Effect.void));
+          yield* removeFile(backupShm).pipe(Effect.catchAll(() => Effect.void));
 
-        const totals = yield* get<Record<string, unknown>>(
-          db,
-          `
-            SELECT
-              COUNT(*) AS thread_count,
-              COALESCE(SUM(message_count), 0) AS message_count
-            FROM threads
-          `,
-        ).pipe(
-          Effect.map((row) => ({
-            threadCount: Number(row?.thread_count ?? 0),
-            messageCount: Number(row?.message_count ?? 0),
-          })),
-        );
-
-        return {
-          builtAt,
-          threadCount: totals.threadCount,
-          messageCount: totals.messageCount,
-          activeSessionFileCount: allSessions.filter((snapshot) => snapshot.archived === 0).length,
-          archivedSessionFileCount: allSessions.filter((snapshot) => snapshot.archived === 1).length,
-        };
-      }),
+          return stats;
+        }),
+      () =>
+        Effect.forEach(cleanupPaths, (path) => removeFile(path).pipe(Effect.catchAll(() => Effect.void)), {
+          concurrency: "unbounded",
+          discard: true,
+        }),
     );
   });
 }

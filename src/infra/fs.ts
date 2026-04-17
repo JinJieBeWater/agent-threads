@@ -1,6 +1,6 @@
 import { BunFileSystem } from "@effect/platform-bun";
 import * as FileSystem from "@effect/platform/FileSystem";
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 import { Effect, Option } from "effect";
 
 import { CliFailure } from "../errors.ts";
@@ -86,6 +86,15 @@ export function ensureParentDirectory(path: string): Effect.Effect<void, CliFail
   const index = path.lastIndexOf("/");
   const directory = index >= 0 ? path.slice(0, index) : ".";
   return makeDirectory(directory.length > 0 ? directory : ".");
+}
+
+export function renamePath(from: string, to: string): Effect.Effect<void, CliFailure> {
+  return Effect.tryPromise({
+    try: async () => {
+      await rename(from, to);
+    },
+    catch: () => new CliFailure({ code: "fs-rename-failed", message: `Unable to rename path: ${from} -> ${to}` }),
+  });
 }
 
 export function writeExclusiveFile(path: string, contents: string): Effect.Effect<void, CliFailure> {

@@ -9,6 +9,13 @@ const INDEX_LOCK_WAIT_MS = 15_000;
 const INDEX_LOCK_POLL_MS = 100;
 const INDEX_LOCK_POLL_INTERVAL = `${INDEX_LOCK_POLL_MS} millis` as const;
 
+export interface IndexWriterLease {
+  pid: number | null;
+  startedAt: string | null;
+  mode: string | null;
+  lockFile: string;
+}
+
 function getIndexLockFile(paths: ResolvedPaths): string {
   return `${paths.indexDb}.lock`;
 }
@@ -43,63 +50,127 @@ function pruneStaleIndexLock(lockFile: string): Effect.Effect<void> {
   });
 }
 
-export function waitForUnlockedIndex(paths: ResolvedPaths): Effect.Effect<void> {
-  const lockFile = getIndexLockFile(paths);
+function parseIndexWriterLease(lockFile: string, contents: string): IndexWriterLease {
+  const [pidToken, startedAtToken, modeToken] = contents.trim().split(/\s+/, 3);
+  return {
+    pid: pidToken && /^\d+$/.test(pidToken) ? Number(pidToken) : null,
+    startedAt: startedAtToken && startedAtToken.length > 0 ? startedAtToken : null,
+    mode: modeToken && modeToken.length > 0 ? modeToken : null,
+    lockFile,
+  };
+}
 
-  const wait = (): Effect.Effect<void> =>
-    pruneStaleIndexLock(lockFile).pipe(
-      Effect.flatMap(() => fileExists(lockFile).pipe(Effect.catchAll(() => Effect.succeed(false)))),
-      Effect.flatMap((exists) =>
-        exists
-          ? Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(Effect.flatMap(wait))
-          : Effect.void,
-      ),
+export function readActiveIndexWriter(paths: ResolvedPaths): Effect.Effect<IndexWriterLease | null> {
+  const lockFile = getIndexLockFile(paths);
+  return Effect.gen(function* () {
+    yield* pruneStaleIndexLock(lockFile).pipe(Effect.catchAll(() => Effect.void));
+    const exists = yield* fileExists(lockFile).pipe(Effect.catchAll(() => Effect.succeed(false)));
+    if (!exists) {
+      return null;
+    }
+
+    const contents = yield* readFileString(lockFile).pipe(Effect.catchAll(() => Effect.succeed("")));
+    return parseIndexWriterLease(lockFile, contents);
+  });
+}
+
+export function waitForIndexWriter(paths: ResolvedPaths, timeoutMs = INDEX_LOCK_WAIT_MS): Effect.Effect<void, CliFailure> {
+  const startedAt = Date.now();
+
+  const wait = (): Effect.Effect<void, CliFailure> =>
+    readActiveIndexWriter(paths).pipe(
+      Effect.flatMap((lease) => {
+        if (!lease) {
+          return Effect.void;
+        }
+        if (Date.now() - startedAt > timeoutMs) {
+          return Effect.fail(
+            new CliFailure({
+              code: "index-lock-timeout",
+              message: `Timed out waiting for index lock: ${lease.lockFile}`,
+            }),
+          );
+        }
+        return Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(Effect.flatMap(wait));
+      }),
     );
 
   return wait();
 }
 
-export function withIndexBuildLock<A>(
+function acquireIndexWriterLease(
+  lockFile: string,
+  mode: string,
+  startedAt: number,
+  waitForLease: boolean,
+): Effect.Effect<boolean, CliFailure> {
+  return writeExclusiveFile(lockFile, `${process.pid} ${new Date().toISOString()} ${mode}\n`).pipe(
+    Effect.as(true),
+    Effect.catchTag("CliFailure", (error) => {
+      if (error.code !== "fs-already-exists") {
+        return Effect.fail(error);
+      }
+      return pruneStaleIndexLock(lockFile).pipe(
+        Effect.flatMap(() => fileExists(lockFile)),
+        Effect.flatMap((exists) => {
+          if (!exists) {
+            return acquireIndexWriterLease(lockFile, mode, startedAt, waitForLease);
+          }
+          if (!waitForLease) {
+            return Effect.succeed(false);
+          }
+          if (Date.now() - startedAt > INDEX_LOCK_WAIT_MS) {
+            return Effect.fail(
+              new CliFailure({
+                code: "index-lock-timeout",
+                message: `Timed out waiting for index lock: ${lockFile}`,
+              }),
+            );
+          }
+          return Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(
+            Effect.flatMap(() => acquireIndexWriterLease(lockFile, mode, startedAt, waitForLease)),
+          );
+        }),
+      );
+    }),
+  );
+}
+
+function withIndexWriterLeaseInternal<A>(
   paths: ResolvedPaths,
+  mode: string,
+  waitForLease: boolean,
   callback: Effect.Effect<A, CliFailure>,
-): Effect.Effect<A, CliFailure> {
+): Effect.Effect<A | null, CliFailure> {
   const lockFile = getIndexLockFile(paths);
 
-  const acquire = (startedAt: number): Effect.Effect<void, CliFailure> =>
-    writeExclusiveFile(lockFile, `${process.pid} ${new Date().toISOString()}\n`).pipe(
-      Effect.catchTag("CliFailure", (error) => {
-        if (error.code !== "fs-already-exists") {
-          return Effect.fail(error);
-        }
-        return pruneStaleIndexLock(lockFile).pipe(
-          Effect.flatMap(() => fileExists(lockFile)),
-          Effect.flatMap((exists) => {
-            if (!exists) {
-              return Effect.fail(new CliFailure({ code: "retry-lock-acquire", message: "retry" }));
-            }
-            if (Date.now() - startedAt > INDEX_LOCK_WAIT_MS) {
-              return Effect.fail(
-                new CliFailure({
-                  code: "index-lock-timeout",
-                  message: `Timed out waiting for index lock: ${lockFile}`,
-                }),
-              );
-            }
-            return Effect.fail(new CliFailure({ code: "retry-lock-acquire", message: "retry" }));
-          }),
-        );
-      }),
-    ).pipe(
-      Effect.catchTag("CliFailure", (error) =>
-        error.code === "retry-lock-acquire"
-          ? Effect.sleep(INDEX_LOCK_POLL_INTERVAL).pipe(Effect.flatMap(() => acquire(startedAt)))
-          : Effect.fail(error),
-      ),
-    );
-
   return Effect.acquireUseRelease(
-    ensureParentDirectory(lockFile).pipe(Effect.flatMap(() => acquire(Date.now()))),
-    () => callback,
-    () => removeFile(lockFile).pipe(Effect.catchAll(() => Effect.void)),
+    ensureParentDirectory(lockFile).pipe(
+      Effect.flatMap(() => acquireIndexWriterLease(lockFile, mode, Date.now(), waitForLease)),
+    ),
+    (acquired) => (acquired ? callback : Effect.succeed(null)),
+    (acquired) => (acquired ? removeFile(lockFile).pipe(Effect.catchAll(() => Effect.void)) : Effect.void),
   );
+}
+
+export function withIndexWriterLease<A>(
+  paths: ResolvedPaths,
+  mode: string,
+  callback: Effect.Effect<A, CliFailure>,
+): Effect.Effect<A, CliFailure> {
+  return withIndexWriterLeaseInternal(paths, mode, true, callback).pipe(
+    Effect.flatMap((result) =>
+      result === null
+        ? Effect.fail(new CliFailure({ code: "index-lock-timeout", message: `Timed out waiting for index lock: ${getIndexLockFile(paths)}` }))
+        : Effect.succeed(result),
+    ),
+  );
+}
+
+export function tryWithIndexWriterLease<A>(
+  paths: ResolvedPaths,
+  mode: string,
+  callback: Effect.Effect<A, CliFailure>,
+): Effect.Effect<A | null, CliFailure> {
+  return withIndexWriterLeaseInternal(paths, mode, false, callback);
 }

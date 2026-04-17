@@ -3580,22 +3580,59 @@ test("concurrent first-run queries wait on the rebuild lock instead of failing",
   }
 }, 15_000);
 
-test("read queries wait for an active rebuild lock and then succeed", async () => {
+test("ready-index read queries ignore an active writer lock and return stale results immediately", async () => {
   const sourceRoot = makeFakeSourceRoot();
   const indexDb = join(tmpdir(), `agent-threads-active-lock-${Date.now()}.sqlite`);
 
   const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
   expect(initial.status).toBe(0);
 
-  const db = new Database(indexDb);
-  try {
-    db.exec("UPDATE threads SET message_count = 0");
-  } finally {
-    db.close();
-  }
+  const newThreadId = "thread-lock-stale";
+  const newSessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-lock-stale.jsonl");
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: newThreadId,
+      title: "Lock stale thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T05:00:00.000Z",
+          role: "user",
+          text: "show me the stale lock behavior",
+        },
+        {
+          timestamp: "2026-04-11T05:00:01.000Z",
+          role: "assistant",
+          text: "the stale index should still answer immediately",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  insertStateThread({
+    dbPath: join(sourceRoot, "state_5.sqlite"),
+    threadId: newThreadId,
+    rolloutPath: newSessionPath,
+    cwd: "/tmp/project",
+    title: "Lock stale thread",
+    updatedAt: 1_744_347_201_000,
+    firstUserMessage: "show me the stale lock behavior",
+  });
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: newThreadId,
+      thread_name: "Lock stale thread",
+      updated_at: "2026-04-11T05:00:01.000Z",
+    },
+  ]);
 
   const lockFile = `${indexDb}.lock`;
-  writeFileSync(lockFile, `999999 ${new Date().toISOString()}\n`, "utf8");
+  writeFileSync(lockFile, `999999 ${new Date().toISOString()} incremental\n`, "utf8");
 
   const releaseTimer = setTimeout(() => {
     try {
@@ -3603,13 +3640,13 @@ test("read queries wait for an active rebuild lock and then succeed", async () =
     } catch {
       // Ignore cleanup races if the lock file has already been removed.
     }
-  }, 16_000);
+  }, 5_000);
 
   const startedAt = Date.now();
   try {
     const result = await runCliAsync(["--json", "find", "notify_url", "--kind", "message"], sourceRoot, indexDb);
     expect(result.status).toBe(0);
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(16_000);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
     const payload = JSON.parse(result.stdout) as {
       ok: true;
       data: { results: Array<Record<string, unknown>> };
@@ -3624,7 +3661,180 @@ test("read queries wait for an active rebuild lock and then succeed", async () =
       // Ignore cleanup races if the file is already gone.
     }
   }
-}, 25_000);
+}, 15_000);
+
+test("strict refresh queries wait for an active writer lock and then observe newly synced threads", async () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-refresh-lock-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const newThreadId = "thread-refresh-after-lock";
+  const newSessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-refresh-after-lock.jsonl");
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: newThreadId,
+      title: "Strict refresh thread",
+      messages: [
+        {
+          timestamp: "2026-04-11T06:00:00.000Z",
+          role: "user",
+          text: "strict refresh should wait for the writer",
+        },
+        {
+          timestamp: "2026-04-11T06:00:01.000Z",
+          role: "assistant",
+          text: "the strict path should see this after the lock clears",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  insertStateThread({
+    dbPath: join(sourceRoot, "state_5.sqlite"),
+    threadId: newThreadId,
+    rolloutPath: newSessionPath,
+    cwd: "/tmp/project",
+    title: "Strict refresh thread",
+    updatedAt: 1_744_350_401_000,
+    firstUserMessage: "strict refresh should wait for the writer",
+  });
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: newThreadId,
+      thread_name: "Strict refresh thread",
+      updated_at: "2026-04-11T06:00:01.000Z",
+    },
+  ]);
+
+  const lockFile = `${indexDb}.lock`;
+  writeFileSync(lockFile, `999999 ${new Date().toISOString()} incremental\n`, "utf8");
+
+  const releaseTimer = setTimeout(() => {
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the lock file has already been removed.
+    }
+  }, 1_500);
+
+  const startedAt = Date.now();
+  try {
+    const result = await runCliAsync(["--json", "--refresh", "inspect", "thread", newThreadId], sourceRoot, indexDb);
+    expect(result.status).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500);
+    const payload = JSON.parse(result.stdout) as {
+      ok: true;
+      data: { thread: Record<string, unknown> };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.data.thread.thread_id).toBe(newThreadId);
+  } finally {
+    clearTimeout(releaseTimer);
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the file is already gone.
+    }
+  }
+}, 15_000);
+
+test("exact thread lookups retry after a stale miss when an active writer is present", async () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-exact-retry-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const newThreadId = "thread-retry-after-stale-miss";
+  const newSessionPath = join(
+    sourceRoot,
+    "sessions",
+    "2026",
+    "04",
+    "11",
+    "rollout-thread-retry-after-stale-miss.jsonl",
+  );
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: newThreadId,
+      title: "Retry after stale miss",
+      messages: [
+        {
+          timestamp: "2026-04-11T07:00:00.000Z",
+          role: "user",
+          text: "please find this exact thread after the writer finishes",
+        },
+        {
+          timestamp: "2026-04-11T07:00:01.000Z",
+          role: "assistant",
+          text: "the retry path should recover this exact lookup",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  insertStateThread({
+    dbPath: join(sourceRoot, "state_5.sqlite"),
+    threadId: newThreadId,
+    rolloutPath: newSessionPath,
+    cwd: "/tmp/project",
+    title: "Retry after stale miss",
+    updatedAt: 1_744_354_001_000,
+    firstUserMessage: "please find this exact thread after the writer finishes",
+  });
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: newThreadId,
+      thread_name: "Retry after stale miss",
+      updated_at: "2026-04-11T07:00:01.000Z",
+    },
+  ]);
+
+  const lockFile = `${indexDb}.lock`;
+  writeFileSync(lockFile, `999999 ${new Date().toISOString()} incremental\n`, "utf8");
+
+  const releaseTimer = setTimeout(() => {
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the lock file has already been removed.
+    }
+  }, 1_500);
+
+  const startedAt = Date.now();
+  try {
+    const result = await runCliAsync(["--json", "inspect", "thread", newThreadId], sourceRoot, indexDb);
+    expect(result.status).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500);
+    const payload = JSON.parse(result.stdout) as {
+      ok: true;
+      data: { thread: Record<string, unknown> };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.data.thread.thread_id).toBe(newThreadId);
+  } finally {
+    clearTimeout(releaseTimer);
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // Ignore cleanup races if the file is already gone.
+    }
+  }
+}, 15_000);
 
 test("invalid ready indexes rebuild successfully when no lock file exists yet", () => {
   const sourceRoot = makeFakeSourceRoot();

@@ -6,7 +6,7 @@ import { resolvePaths, writeConfigFile } from "./config.ts";
 import { CliFailure } from "./errors.ts";
 import { exportThreadData, readRawJsonl } from "./export.ts";
 import { fileExists, removeFile } from "./infra/fs.ts";
-import { ensureIndex, readIndexMeta, rebuildIndex } from "./indexer.ts";
+import { ensureIndex, readIndexMeta, rebuildIndex, type EnsureIndexResult } from "./indexer.ts";
 import { getMessageContext, searchMessages } from "./messages.ts";
 import { runReadOnlySql } from "./request.ts";
 import {
@@ -134,20 +134,22 @@ function withResolvedPaths<A>(
 
 function withReadyIndex<A>(
   options: GlobalOptions,
-  callback: (paths: ResolvedPaths) => Effect.Effect<A, CliFailure>,
+  callback: (paths: ResolvedPaths, ready: EnsureIndexResult) => Effect.Effect<A, CliFailure>,
 ): Effect.Effect<A, CliFailure> {
   return withResolvedPaths(options, (paths) =>
-    Effect.matchEffect(ensureIndex(paths, options.refresh), {
+    Effect.matchEffect(ensureIndex(paths, options.refresh ? "strict" : "bounded-stale"), {
       onFailure: (error) => {
         if (!shouldUseTemporaryIndexFallback(error, paths)) {
           return Effect.fail(error);
         }
 
         return withTemporaryIndex(paths, (temporaryPaths) =>
-          ensureIndex(temporaryPaths, options.refresh).pipe(Effect.flatMap(() => callback(temporaryPaths))),
+          ensureIndex(temporaryPaths, options.refresh ? "strict" : "bounded-stale").pipe(
+            Effect.flatMap((ready) => callback(temporaryPaths, ready)),
+          ),
         );
       },
-      onSuccess: () => callback(paths),
+      onSuccess: (ready) => callback(paths, ready),
     }),
   );
 }
@@ -198,6 +200,64 @@ function getExistingThread(
   return getThread(paths, threadId).pipe(
     Effect.flatMap((thread) => thread ? Effect.succeed(thread) : fail("thread-not-found", `Thread not found: ${threadId}`)),
   );
+}
+
+function canRetryExactLookup(options: GlobalOptions, ready: EnsureIndexResult): boolean {
+  return !options.refresh && ready.freshness === "stale" && ready.activeWriterObserved;
+}
+
+function retryAfterWaitingForFreshIndex(
+  paths: ResolvedPaths,
+  ready: EnsureIndexResult,
+  options: GlobalOptions,
+): Effect.Effect<void, CliFailure> {
+  if (!canRetryExactLookup(options, ready)) {
+    return Effect.void;
+  }
+
+  return ensureIndex(paths, "strict").pipe(Effect.asVoid);
+}
+
+function getExactThread(
+  paths: ResolvedPaths,
+  ready: EnsureIndexResult,
+  options: GlobalOptions,
+  threadId: string,
+): Effect.Effect<Record<string, unknown>, CliFailure> {
+  return Effect.gen(function* () {
+    const thread = yield* getThread(paths, threadId);
+    if (thread) {
+      return thread;
+    }
+
+    yield* retryAfterWaitingForFreshIndex(paths, ready, options);
+    return yield* getExistingThread(paths, threadId);
+  });
+}
+
+function getExactMessageContext(
+  paths: ResolvedPaths,
+  ready: EnsureIndexResult,
+  options: GlobalOptions,
+  input: {
+    threadId: string;
+    messageSelector: string;
+    before: number;
+    after: number;
+  },
+): Effect.Effect<{
+  anchor: Record<string, unknown>;
+  messages: Array<Record<string, unknown>>;
+} | null, CliFailure> {
+  return Effect.gen(function* () {
+    const context = yield* getMessageContext(paths, input);
+    if (context) {
+      return context;
+    }
+
+    yield* retryAfterWaitingForFreshIndex(paths, ready, options);
+    return yield* getMessageContext(paths, input);
+  });
 }
 
 function parseTimeFilter(value: string | undefined, label: string): Effect.Effect<number | undefined, CliFailure> {
@@ -346,7 +406,7 @@ export function handleInspectSource(options: GlobalOptions): Effect.Effect<Recor
   return Effect.gen(function* () {
     const paths = yield* resolvePaths(options);
     if (options.refresh) {
-      yield* ensureIndex(paths, true);
+      yield* ensureIndex(paths, "strict");
     }
     const indexMeta = yield* readIndexMeta(paths);
     const stateDbExists = yield* fileExists(paths.stateDb);
@@ -387,7 +447,7 @@ export function handleInspectSource(options: GlobalOptions): Effect.Effect<Recor
 }
 
 export function handleInspectIndex(options: GlobalOptions): Effect.Effect<unknown, CliFailure> {
-  return withReadyIndex(options, getThreadStats);
+  return withReadyIndex(options, (paths) => getThreadStats(paths));
 }
 
 export function handleInspectThread(
@@ -395,12 +455,13 @@ export function handleInspectThread(
   related: boolean,
   options: GlobalOptions,
 ): Effect.Effect<unknown, CliFailure> {
-  return withReadyIndex(options, (paths) =>
+  return withReadyIndex(options, (paths, ready) =>
     Effect.gen(function* () {
-      const thread = yield* getExistingThread(paths, yield* ensureValue(threadId, "thread id"));
+      const normalizedThreadId = yield* ensureValue(threadId, "thread id");
+      const thread = yield* getExactThread(paths, ready, options, normalizedThreadId);
       return {
         thread,
-        related: related ? yield* getRelatedThreads(paths, threadId, 10) : [],
+        related: related ? yield* getRelatedThreads(paths, normalizedThreadId, 10) : [],
       };
     }),
   );
@@ -450,19 +511,19 @@ export function handleExportAction(
   actionOptions: ExportActionOptions,
   options: GlobalOptions,
 ): Effect.Effect<unknown, CliFailure> {
-  return withReadyIndex(options, (paths) =>
+  return withReadyIndex(options, (paths, ready) =>
     Effect.gen(function* () {
       if (kind !== "thread") {
         return yield* fail("invalid-command", `Unknown export kind: ${kind}`);
       }
 
-      const thread = yield* getExistingThread(paths, threadId);
+      const resolvedThread = yield* getExactThread(paths, ready, options, threadId);
       const messages = yield* getThreadMessages(paths, threadId);
 
       return yield* exportThreadData({
         threadId,
         format: actionOptions.format,
-        thread,
+        thread: resolvedThread,
         messages,
         outPath: actionOptions.out,
       });
@@ -579,13 +640,13 @@ export function handleOpen(
   actionOptions: OpenActionOptions,
   options: GlobalOptions,
 ): Effect.Effect<unknown, CliFailure> {
-  return withReadyIndex(options, (paths) =>
+  return withReadyIndex(options, (paths, ready) =>
     Effect.gen(function* () {
       const parsedTarget = parseOpenTarget(yield* ensureValue(target, "target"));
 
       if (parsedTarget.messageSelector) {
-        const thread = yield* getExistingThread(paths, parsedTarget.threadId);
-        const context = yield* getMessageContext(paths, {
+        const thread = yield* getExactThread(paths, ready, options, parsedTarget.threadId);
+        const context = yield* getExactMessageContext(paths, ready, options, {
           threadId: parsedTarget.threadId,
           messageSelector: parsedTarget.messageSelector,
           before: actionOptions.before,
@@ -605,7 +666,7 @@ export function handleOpen(
         };
       }
 
-      const thread = yield* getExistingThread(paths, parsedTarget.threadId);
+      const thread = yield* getExactThread(paths, ready, options, parsedTarget.threadId);
       if (actionOptions.format === "jsonl") {
         const raw = yield* readRawJsonl(thread);
         if (!raw) {

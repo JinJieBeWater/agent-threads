@@ -2,7 +2,7 @@ import { Effect } from "effect";
 
 import { resolvePaths } from "./config.ts";
 import type { CliFailure } from "./errors.ts";
-import { waitForUnlockedIndex, withIndexBuildLock } from "./infra/lock.ts";
+import { readActiveIndexWriter, tryWithIndexWriterLease, waitForIndexWriter, withIndexWriterLease } from "./infra/lock.ts";
 import { readIndexMetaInternal } from "./indexer-store.ts";
 import {
   canSkipIncrementalSync,
@@ -16,46 +16,98 @@ import type { GlobalOptions, ResolvedPaths } from "./types.ts";
 
 export type { RebuildIndexStats } from "./indexer-sync.ts";
 
+export interface EnsureIndexResult {
+  freshness: "fresh" | "stale";
+  activeWriterObserved: boolean;
+}
+
+export type EnsureIndexMode = "bounded-stale" | "strict";
+
 export function readIndexMeta(paths: ResolvedPaths): Effect.Effect<Record<string, string>, CliFailure> {
   return readIndexMetaInternal(paths);
 }
 
 export function rebuildIndex(paths: ResolvedPaths): Effect.Effect<RebuildIndexStats, CliFailure> {
-  return withIndexBuildLock(paths, rebuildIndexUnlocked(paths));
+  return withIndexWriterLease(paths, "rebuild", rebuildIndexUnlocked(paths));
 }
 
-export function ensureIndex(paths: ResolvedPaths, _refresh: boolean): Effect.Effect<void, CliFailure> {
+function synchronizeIndex(paths: ResolvedPaths): Effect.Effect<void, CliFailure> {
   return Effect.gen(function* () {
     if (yield* canSkipIncrementalSync(paths)) {
       return;
     }
 
-    yield* waitForUnlockedIndex(paths);
-
-    if (yield* canSkipIncrementalSync(paths)) {
+    const usable = yield* isIndexUsable(paths);
+    if (!usable) {
+      yield* rebuildIndexUnlocked(paths, "in-place");
       return;
     }
 
-    yield* withIndexBuildLock(
-      paths,
-      Effect.gen(function* () {
-        if (yield* canSkipIncrementalSync(paths)) {
-          return;
-        }
+    if (yield* synchronizeTrustedActiveThreadsUnlocked(paths)) {
+      return;
+    }
 
-        const usable = yield* isIndexUsable(paths);
-        if (!usable) {
-          yield* rebuildIndexUnlocked(paths);
-          return;
-        }
+    yield* synchronizeIncrementalUnlocked(paths);
+  });
+}
 
-        if (yield* synchronizeTrustedActiveThreadsUnlocked(paths)) {
-          return;
-        }
+export function ensureIndex(paths: ResolvedPaths, mode: EnsureIndexMode): Effect.Effect<EnsureIndexResult, CliFailure> {
+  return Effect.gen(function* () {
+    if (yield* canSkipIncrementalSync(paths)) {
+      return {
+        freshness: "fresh",
+        activeWriterObserved: false,
+      } satisfies EnsureIndexResult;
+    }
 
-        yield* synchronizeIncrementalUnlocked(paths);
-      }),
-    );
+    const usable = yield* isIndexUsable(paths);
+    const activeWriter = yield* readActiveIndexWriter(paths);
+
+    if (!usable) {
+      if (activeWriter) {
+        yield* waitForIndexWriter(paths);
+        return yield* ensureIndex(paths, mode);
+      }
+
+      yield* withIndexWriterLease(paths, "rebuild", synchronizeIndex(paths));
+      return {
+        freshness: "fresh",
+        activeWriterObserved: false,
+      } satisfies EnsureIndexResult;
+    }
+
+    if (mode === "bounded-stale") {
+      if (activeWriter) {
+        return {
+          freshness: "stale",
+          activeWriterObserved: true,
+        } satisfies EnsureIndexResult;
+      }
+
+      const acquired = yield* tryWithIndexWriterLease(paths, "incremental", synchronizeIndex(paths));
+      if (acquired === null) {
+        return {
+          freshness: "stale",
+          activeWriterObserved: true,
+        } satisfies EnsureIndexResult;
+      }
+
+      return {
+        freshness: "fresh",
+        activeWriterObserved: false,
+      } satisfies EnsureIndexResult;
+    }
+
+    if (activeWriter) {
+      yield* waitForIndexWriter(paths);
+      return yield* ensureIndex(paths, mode);
+    }
+
+    yield* withIndexWriterLease(paths, "incremental", synchronizeIndex(paths));
+    return {
+      freshness: "fresh",
+      activeWriterObserved: false,
+    } satisfies EnsureIndexResult;
   });
 }
 
