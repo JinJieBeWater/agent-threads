@@ -50,12 +50,25 @@ function pruneStaleIndexLock(lockFile: string): Effect.Effect<void> {
   });
 }
 
-function parseIndexWriterLease(lockFile: string, contents: string): IndexWriterLease {
-  const [pidToken, startedAtToken, modeToken] = contents.trim().split(/\s+/, 3);
+function parseIndexWriterLease(lockFile: string, contents: string): IndexWriterLease | null {
+  const trimmed = contents.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  const [pidToken, startedAtToken, modeToken] = trimmed.split(/\s+/, 3);
+  const pid = pidToken && /^\d+$/.test(pidToken) ? Number(pidToken) : null;
+  const startedAt = startedAtToken && startedAtToken.length > 0 ? startedAtToken : null;
+  const mode = modeToken && modeToken.length > 0 ? modeToken : null;
+
+  if (pid === null && startedAt === null && mode === null) {
+    return null;
+  }
+
   return {
-    pid: pidToken && /^\d+$/.test(pidToken) ? Number(pidToken) : null,
-    startedAt: startedAtToken && startedAtToken.length > 0 ? startedAtToken : null,
-    mode: modeToken && modeToken.length > 0 ? modeToken : null,
+    pid,
+    startedAt,
+    mode,
     lockFile,
   };
 }
