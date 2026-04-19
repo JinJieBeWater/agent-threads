@@ -53,6 +53,15 @@ export interface RebuildIndexStats {
   archivedSessionFileCount: number;
 }
 
+function sleepBeforePromotingShadowIndexForTest(): Effect.Effect<void> {
+  const rawValue = process.env.ATH_TEST_INDEX_SWAP_BEFORE_PROMOTE_MS;
+  const delayMs = rawValue ? Number(rawValue) : 0;
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return Effect.void;
+  }
+  return Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+}
+
 export function scanSourceFiles(paths: ResolvedPaths): Effect.Effect<SourceFileSnapshot[], CliFailure> {
   return Effect.gen(function* () {
     const activePaths = yield* walkJsonlFiles(paths.sessionsDir);
@@ -1196,45 +1205,12 @@ export function rebuildIndexUnlocked(
           yield* removeFile(`${preparedPaths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.void));
           yield* removeFile(`${preparedPaths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.void));
 
-          const backupSuffix = `.bak-${process.pid}-${Date.now()}`;
-          const backupIndexDb = `${paths.indexDb}${backupSuffix}`;
-          const backupWal = `${backupIndexDb}-wal`;
-          const backupShm = `${backupIndexDb}-shm`;
+          yield* sleepBeforePromotingShadowIndexForTest();
+          yield* renamePath(preparedPaths.indexDb, paths.indexDb);
 
-          const existingMain = yield* fileExists(paths.indexDb).pipe(Effect.catchAll(() => Effect.succeed(false)));
-          const existingWal = yield* fileExists(`${paths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.succeed(false)));
-          const existingShm = yield* fileExists(`${paths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.succeed(false)));
-
-          if (existingMain) {
-            yield* renamePath(paths.indexDb, backupIndexDb);
-          }
-          if (existingWal) {
-            yield* renamePath(`${paths.indexDb}-wal`, backupWal);
-          }
-          if (existingShm) {
-            yield* renamePath(`${paths.indexDb}-shm`, backupShm);
-          }
-
-          yield* renamePath(preparedPaths.indexDb, paths.indexDb).pipe(
-            Effect.catchTag("CliFailure", (error) =>
-              Effect.gen(function* () {
-                if (existingMain) {
-                  yield* renamePath(backupIndexDb, paths.indexDb).pipe(Effect.catchAll(() => Effect.void));
-                }
-                if (existingWal) {
-                  yield* renamePath(backupWal, `${paths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.void));
-                }
-                if (existingShm) {
-                  yield* renamePath(backupShm, `${paths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.void));
-                }
-                return yield* Effect.fail(error);
-              }),
-            ),
-          );
-
-          yield* removeFile(backupIndexDb).pipe(Effect.catchAll(() => Effect.void));
-          yield* removeFile(backupWal).pipe(Effect.catchAll(() => Effect.void));
-          yield* removeFile(backupShm).pipe(Effect.catchAll(() => Effect.void));
+          // Readers can keep using the pre-swap file handle while the path now resolves to the rebuilt index.
+          yield* removeFile(`${paths.indexDb}-wal`).pipe(Effect.catchAll(() => Effect.void));
+          yield* removeFile(`${paths.indexDb}-shm`).pipe(Effect.catchAll(() => Effect.void));
 
           return stats;
         }),

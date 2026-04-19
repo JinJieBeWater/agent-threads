@@ -218,21 +218,32 @@ function retryAfterWaitingForFreshIndex(
   return ensureIndex(paths, "strict").pipe(Effect.asVoid);
 }
 
+function retryExactLookup<A>(
+  paths: ResolvedPaths,
+  ready: EnsureIndexResult,
+  options: GlobalOptions,
+  lookup: () => Effect.Effect<A | null, CliFailure>,
+): Effect.Effect<A | null, CliFailure> {
+  return Effect.gen(function* () {
+    const result = yield* lookup();
+    if (result !== null) {
+      return result;
+    }
+
+    yield* retryAfterWaitingForFreshIndex(paths, ready, options);
+    return yield* lookup();
+  });
+}
+
 function getExactThread(
   paths: ResolvedPaths,
   ready: EnsureIndexResult,
   options: GlobalOptions,
   threadId: string,
 ): Effect.Effect<Record<string, unknown>, CliFailure> {
-  return Effect.gen(function* () {
-    const thread = yield* getThread(paths, threadId);
-    if (thread) {
-      return thread;
-    }
-
-    yield* retryAfterWaitingForFreshIndex(paths, ready, options);
-    return yield* getExistingThread(paths, threadId);
-  });
+  return retryExactLookup(paths, ready, options, () => getThread(paths, threadId)).pipe(
+    Effect.flatMap((thread) => thread ? Effect.succeed(thread) : fail("thread-not-found", `Thread not found: ${threadId}`)),
+  );
 }
 
 function getExactMessageContext(
@@ -249,15 +260,7 @@ function getExactMessageContext(
   anchor: Record<string, unknown>;
   messages: Array<Record<string, unknown>>;
 } | null, CliFailure> {
-  return Effect.gen(function* () {
-    const context = yield* getMessageContext(paths, input);
-    if (context) {
-      return context;
-    }
-
-    yield* retryAfterWaitingForFreshIndex(paths, ready, options);
-    return yield* getMessageContext(paths, input);
-  });
+  return retryExactLookup(paths, ready, options, () => getMessageContext(paths, input));
 }
 
 function parseTimeFilter(value: string | undefined, label: string): Effect.Effect<number | undefined, CliFailure> {

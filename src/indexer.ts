@@ -23,6 +23,16 @@ export interface EnsureIndexResult {
 
 export type EnsureIndexMode = "bounded-stale" | "strict";
 
+const FRESH_INDEX_RESULT = {
+  freshness: "fresh",
+  activeWriterObserved: false,
+} satisfies EnsureIndexResult;
+
+const STALE_INDEX_RESULT = {
+  freshness: "stale",
+  activeWriterObserved: true,
+} satisfies EnsureIndexResult;
+
 export function readIndexMeta(paths: ResolvedPaths): Effect.Effect<Record<string, string>, CliFailure> {
   return readIndexMetaInternal(paths);
 }
@@ -51,13 +61,31 @@ function synchronizeIndex(paths: ResolvedPaths): Effect.Effect<void, CliFailure>
   });
 }
 
+function waitForWriterAndRetry(
+  paths: ResolvedPaths,
+  mode: EnsureIndexMode,
+): Effect.Effect<EnsureIndexResult, CliFailure> {
+  return waitForIndexWriter(paths).pipe(Effect.flatMap(() => ensureIndex(paths, mode)));
+}
+
+function ensureUsableIndex(paths: ResolvedPaths): Effect.Effect<EnsureIndexResult, CliFailure> {
+  return withIndexWriterLease(paths, "rebuild", synchronizeIndex(paths)).pipe(Effect.as(FRESH_INDEX_RESULT));
+}
+
+function ensureBoundedStaleIndex(paths: ResolvedPaths): Effect.Effect<EnsureIndexResult, CliFailure> {
+  return tryWithIndexWriterLease(paths, "incremental", synchronizeIndex(paths)).pipe(
+    Effect.map((result) => (result === null ? STALE_INDEX_RESULT : FRESH_INDEX_RESULT)),
+  );
+}
+
+function ensureStrictIndex(paths: ResolvedPaths): Effect.Effect<EnsureIndexResult, CliFailure> {
+  return withIndexWriterLease(paths, "incremental", synchronizeIndex(paths)).pipe(Effect.as(FRESH_INDEX_RESULT));
+}
+
 export function ensureIndex(paths: ResolvedPaths, mode: EnsureIndexMode): Effect.Effect<EnsureIndexResult, CliFailure> {
   return Effect.gen(function* () {
     if (yield* canSkipIncrementalSync(paths)) {
-      return {
-        freshness: "fresh",
-        activeWriterObserved: false,
-      } satisfies EnsureIndexResult;
+      return FRESH_INDEX_RESULT;
     }
 
     const usable = yield* isIndexUsable(paths);
@@ -65,49 +93,25 @@ export function ensureIndex(paths: ResolvedPaths, mode: EnsureIndexMode): Effect
 
     if (!usable) {
       if (activeWriter) {
-        yield* waitForIndexWriter(paths);
-        return yield* ensureIndex(paths, mode);
+        return yield* waitForWriterAndRetry(paths, mode);
       }
 
-      yield* withIndexWriterLease(paths, "rebuild", synchronizeIndex(paths));
-      return {
-        freshness: "fresh",
-        activeWriterObserved: false,
-      } satisfies EnsureIndexResult;
+      return yield* ensureUsableIndex(paths);
     }
 
     if (mode === "bounded-stale") {
       if (activeWriter) {
-        return {
-          freshness: "stale",
-          activeWriterObserved: true,
-        } satisfies EnsureIndexResult;
+        return STALE_INDEX_RESULT;
       }
 
-      const acquired = yield* tryWithIndexWriterLease(paths, "incremental", synchronizeIndex(paths));
-      if (acquired === null) {
-        return {
-          freshness: "stale",
-          activeWriterObserved: true,
-        } satisfies EnsureIndexResult;
-      }
-
-      return {
-        freshness: "fresh",
-        activeWriterObserved: false,
-      } satisfies EnsureIndexResult;
+      return yield* ensureBoundedStaleIndex(paths);
     }
 
     if (activeWriter) {
-      yield* waitForIndexWriter(paths);
-      return yield* ensureIndex(paths, mode);
+      return yield* waitForWriterAndRetry(paths, mode);
     }
 
-    yield* withIndexWriterLease(paths, "incremental", synchronizeIndex(paths));
-    return {
-      freshness: "fresh",
-      activeWriterObserved: false,
-    } satisfies EnsureIndexResult;
+    return yield* ensureStrictIndex(paths);
   });
 }
 

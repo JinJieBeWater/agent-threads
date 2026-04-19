@@ -427,7 +427,7 @@ function createLegacyReadyIndexDb(
   }
 }
 
-function runCli(args: string[], sourceRoot: string, indexDb: string) {
+function runCli(args: string[], sourceRoot: string, indexDb: string, options?: { env?: NodeJS.ProcessEnv }) {
   return spawnSync(
     "bun",
     [
@@ -442,11 +442,12 @@ function runCli(args: string[], sourceRoot: string, indexDb: string) {
     {
       cwd: projectRoot,
       encoding: "utf8",
+      env: options?.env ? { ...process.env, ...options.env } : process.env,
     },
   );
 }
 
-function runCliAsync(args: string[], sourceRoot: string, indexDb: string) {
+function runCliAsync(args: string[], sourceRoot: string, indexDb: string, options?: { env?: NodeJS.ProcessEnv }) {
   return new Promise<{
     status: number | null;
     stdout: string;
@@ -466,6 +467,7 @@ function runCliAsync(args: string[], sourceRoot: string, indexDb: string) {
       {
         cwd: projectRoot,
         stdio: ["ignore", "pipe", "pipe"],
+        env: options?.env ? { ...process.env, ...options.env } : process.env,
       },
     );
 
@@ -3746,6 +3748,161 @@ test("strict refresh queries wait for an active writer lock and then observe new
     }
   }
 }, 15_000);
+
+test("admin reindex keeps the previous index readable until the rebuilt db is promoted", async () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-reindex-swap-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const newThreadId = "thread-visible-after-promote";
+  const newSessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-visible-after-promote.jsonl");
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: newThreadId,
+      title: "Visible after promote",
+      messages: [
+        {
+          timestamp: "2026-04-11T08:00:00.000Z",
+          role: "user",
+          text: "show me after reindex promote",
+        },
+        {
+          timestamp: "2026-04-11T08:00:01.000Z",
+          role: "assistant",
+          text: "this thread should appear only after the swap finishes",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  insertStateThread({
+    dbPath: join(sourceRoot, "state_5.sqlite"),
+    threadId: newThreadId,
+    rolloutPath: newSessionPath,
+    cwd: "/tmp/project",
+    title: "Visible after promote",
+    updatedAt: 1_744_357_601_000,
+    firstUserMessage: "show me after reindex promote",
+  });
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: newThreadId,
+      thread_name: "Visible after promote",
+      updated_at: "2026-04-11T08:00:01.000Z",
+    },
+  ]);
+
+  const reindexPromise = runCliAsync(["--json", "admin", "reindex"], sourceRoot, indexDb, {
+    env: {
+      ATH_TEST_INDEX_SWAP_BEFORE_PROMOTE_MS: "1500",
+    },
+  });
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 400));
+
+  const staleReadPromise = runCliAsync(["--json", "inspect", "thread", "thread-epay-fix"], sourceRoot, indexDb);
+  const raced = await Promise.race([
+    staleReadPromise.then((result) => ({ kind: "done" as const, result })),
+    new Promise<{ kind: "timeout" }>((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 1_000)),
+  ]);
+
+  expect(raced.kind).toBe("done");
+  if (raced.kind === "done") {
+    expect(raced.result.status).toBe(0);
+    const payload = JSON.parse(raced.result.stdout) as {
+      ok: true;
+      data: { thread: Record<string, unknown> };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.data.thread.thread_id).toBe("thread-epay-fix");
+  }
+
+  const reindex = await reindexPromise;
+  expect(reindex.status).toBe(0);
+
+  const freshRead = runCli(["--json", "inspect", "thread", newThreadId], sourceRoot, indexDb);
+  expect(freshRead.status).toBe(0);
+  const freshPayload = JSON.parse(freshRead.stdout) as {
+    ok: true;
+    data: { thread: Record<string, unknown> };
+  };
+  expect(freshPayload.ok).toBe(true);
+  expect(freshPayload.data.thread.thread_id).toBe(newThreadId);
+}, 15_000);
+
+test("promoted reindexes clean wal artifacts without breaking later incremental reads", async () => {
+  const sourceRoot = makeFakeSourceRoot();
+  const indexDb = join(tmpdir(), `agent-threads-reindex-cleanup-${Date.now()}.sqlite`);
+
+  const initial = runCli(["--json", "--refresh", "inspect", "index"], sourceRoot, indexDb);
+  expect(initial.status).toBe(0);
+
+  const reindex = runCli(["--json", "admin", "reindex"], sourceRoot, indexDb);
+  expect(reindex.status).toBe(0);
+  expect(await Bun.file(`${indexDb}-wal`).exists()).toBe(false);
+  expect(await Bun.file(`${indexDb}-shm`).exists()).toBe(false);
+
+  const newThreadId = "thread-after-reindex-cleanup";
+  const newSessionPath = join(sourceRoot, "sessions", "2026", "04", "11", "rollout-thread-after-reindex-cleanup.jsonl");
+  writeFileSync(
+    newSessionPath,
+    makeSessionJsonl({
+      threadId: newThreadId,
+      title: "Thread after cleanup",
+      messages: [
+        {
+          timestamp: "2026-04-11T08:30:00.000Z",
+          role: "user",
+          text: "can incremental sync still read after cleanup",
+        },
+        {
+          timestamp: "2026-04-11T08:30:01.000Z",
+          role: "assistant",
+          text: "yes, the promoted index should keep accepting later updates",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  insertStateThread({
+    dbPath: join(sourceRoot, "state_5.sqlite"),
+    threadId: newThreadId,
+    rolloutPath: newSessionPath,
+    cwd: "/tmp/project",
+    title: "Thread after cleanup",
+    updatedAt: 1_744_359_401_000,
+    firstUserMessage: "can incremental sync still read after cleanup",
+  });
+  writeSessionIndex(sourceRoot, [
+    {
+      id: "thread-epay-fix",
+      thread_name: "Fix epay callback normalize bug",
+      updated_at: "2026-04-11T02:43:30.000Z",
+    },
+    {
+      id: newThreadId,
+      thread_name: "Thread after cleanup",
+      updated_at: "2026-04-11T08:30:01.000Z",
+    },
+  ]);
+
+  const result = runCli(["--json", "inspect", "thread", newThreadId], sourceRoot, indexDb);
+  expect(result.status).toBe(0);
+  const payload = JSON.parse(result.stdout) as {
+    ok: true;
+    data: { thread: Record<string, unknown> };
+  };
+  expect(payload.ok).toBe(true);
+  expect(payload.data.thread.thread_id).toBe(newThreadId);
+});
 
 test("exact thread lookups retry after a stale miss when an active writer is present", async () => {
   const sourceRoot = makeFakeSourceRoot();
