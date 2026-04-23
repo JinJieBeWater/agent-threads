@@ -193,15 +193,6 @@ function withTemporaryIndex<A>(
   );
 }
 
-function getExistingThread(
-  paths: ResolvedPaths,
-  threadId: string,
-): Effect.Effect<Record<string, unknown>, CliFailure> {
-  return getThread(paths, threadId).pipe(
-    Effect.flatMap((thread) => thread ? Effect.succeed(thread) : fail("thread-not-found", `Thread not found: ${threadId}`)),
-  );
-}
-
 function canRetryExactLookup(options: GlobalOptions, ready: EnsureIndexResult): boolean {
   return !options.refresh && ready.freshness === "stale" && ready.activeWriterObserved;
 }
